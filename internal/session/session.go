@@ -2,18 +2,31 @@ package session
 
 import (
 	"beanckup-cli/internal/manifest"
+	"beanckup-cli/internal/packager"
 	"beanckup-cli/internal/types"
+	"beanckup-cli/internal/util"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const planFileName = "plan.json"
+
+// DeliveryParams 交付参数
+type DeliveryParams struct {
+	DeliveryPath       string
+	PackageSizeLimitMB int // 只在首次交付时设置，续传时不可更改
+	TotalSizeLimitMB   int
+	CompressionLevel   int
+	Password           string
+}
 
 // CreatePlan 根据扫描结果创建交付计划
 func CreatePlan(sessionID int, allNodes []*types.FileNode, packageSizeLimitMB, totalSizeLimitMB int) *types.Plan {
@@ -386,4 +399,208 @@ func CheckAndCleanupDeliveryStatus(workspacePath, deliveryPath string) (*types.P
 	}
 
 	return plan, nil
+}
+
+// ExecuteDeliveryLoop 交付循环，自动处理所有包，无需用户确认
+func ExecuteDeliveryLoop(plan *types.Plan, params *DeliveryParams, workspacePath, beanckupDir string, reader *bufio.Reader) {
+	fmt.Println("\n=== 开始执行交付 ===")
+
+	if err := os.MkdirAll(beanckupDir, 0755); err != nil {
+		log.Fatalf("错误: 无法创建 .beanckup 目录: %v", err)
+	}
+
+	workspaceName := filepath.Base(workspacePath)
+	CleanupIncompletePackages(params.DeliveryPath, plan, workspaceName)
+
+	if err := SavePlan(workspacePath, plan); err != nil {
+		log.Printf("错误: 保存交付计划失败: %v\n", err)
+		return
+	}
+
+	retryCount := 0
+	maxRetry := 3
+
+DELIVERY_LOOP:
+	for {
+		var processedSize int64
+		var hasMoreWork bool
+
+		for i := range plan.Episodes {
+			episode := &plan.Episodes[i]
+			packageName := fmt.Sprintf("%s-S%02dE%02d.zip", workspaceName, plan.SessionID, episode.ID)
+			if episode.Status == types.EpisodeStatusCompleted {
+				continue
+			}
+			if episode.Status == types.EpisodeStatusExceededLimit {
+				hasMoreWork = true
+				continue
+			}
+			if episode.Status == types.EpisodeStatusPending {
+				packagePath := filepath.Join(params.DeliveryPath, packageName)
+				if _, err := os.Stat(packagePath); err == nil {
+					os.Remove(packagePath)
+					fmt.Printf("删除不完整的包文件: %s\n", packageName)
+				}
+			}
+			episode.Status = types.EpisodeStatusInProgress
+			SavePlan(workspacePath, plan)
+			packageManifest := CreatePackageManifest(workspaceName, plan, episode)
+			pkg := packager.NewPackager()
+			progressFunc := func(p packager.Progress) {
+				util.UpdateDeliveryProgress(plan, workspaceName, i, p)
+			}
+			err := pkg.CreatePackage(
+				params.DeliveryPath,
+				packageManifest,
+				workspacePath,
+				episode.Files,
+				params.Password,
+				params.CompressionLevel,
+				progressFunc,
+			)
+			if err != nil {
+				util.UpdateDeliveryStatus(plan, workspaceName, i, "打包失败，自动重试")
+				log.Printf("\n错误: 创建交付包失败: %v", err)
+				episode.Status = types.EpisodeStatusPending
+				retryCount++
+				if retryCount >= maxRetry {
+					log.Printf("包 %s 连续失败 %d 次，跳过。", packageName, maxRetry)
+					hasMoreWork = true
+					retryCount = 0
+					continue
+				}
+				continue DELIVERY_LOOP
+			} else {
+				util.UpdateDeliveryStatus(plan, workspaceName, i, "已交付")
+				episode.Status = types.EpisodeStatusCompleted
+				processedSize += episode.TotalSize
+				globalManifest := CreateGlobalManifest(workspaceName, plan, episode)
+				if _, err := SaveManifest(beanckupDir, globalManifest); err != nil {
+					log.Printf("警告: 无法保存工作区清单: %v", err)
+				}
+			}
+			SavePlan(workspacePath, plan)
+		}
+		if plan.IsCompleted() {
+			fmt.Println("\n★★★ 所有交付任务已成功完成！ ★★★")
+			timestamp := plan.Timestamp.Format("20060102_150405")
+			statusFileName := fmt.Sprintf("Delivery_Status_%s_S%02d_%s.json", workspaceName, plan.SessionID, timestamp)
+			statusPath := filepath.Join(beanckupDir, statusFileName)
+			if err := os.Remove(statusPath); err != nil {
+				log.Printf("警告: 无法删除进度文件: %v", err)
+			} else {
+				fmt.Println("✓ 进度文件已自动清理")
+			}
+			return
+		}
+		if hasMoreWork || plan.CountPending() > 0 {
+			// 自动继续，无需用户确认
+			util.DisplayDeliveryProgress(plan, workspaceName)
+			continue DELIVERY_LOOP
+		}
+	}
+}
+
+// AskForResumeDeliveryParams 只允许更改路径和总大小限制，单包大小不可更改，参数交互与表格刷新彻底分离
+func AskForResumeDeliveryParams(plan *types.Plan, reader *bufio.Reader) *DeliveryParams {
+	params := &DeliveryParams{}
+
+	fmt.Println("\n=== 交付参数设置 ===")
+
+	// 交付路径
+	fmt.Print("请输入交付包保存路径 (回车使用默认): ")
+	input, _ := reader.ReadString('\n')
+	params.DeliveryPath = strings.TrimSpace(input)
+	if params.DeliveryPath == "" {
+		params.DeliveryPath = "./delivery"
+	}
+
+	// 总大小限制
+	fmt.Printf("总文件大小: %.2f MB\n", float64(plan.TotalNewSize)/1024/1024)
+	fmt.Print("请输入本次交付的总大小限制 (MB, 回车表示无限制): ")
+	input, _ = reader.ReadString('\n')
+	if size, err := strconv.Atoi(strings.TrimSpace(input)); err == nil && size > 0 {
+		params.TotalSizeLimitMB = size
+	} else {
+		params.TotalSizeLimitMB = 0
+	}
+
+	// 压缩级别
+	fmt.Print("请输入压缩级别 (0-9, 回车使用默认0): ")
+	input, _ = reader.ReadString('\n')
+	if level, err := strconv.Atoi(strings.TrimSpace(input)); err == nil && level >= 0 && level <= 9 {
+		params.CompressionLevel = level
+	} else {
+		params.CompressionLevel = 0
+	}
+
+	// 密码
+	fmt.Print("请输入加密密码 (回车表示不加密): ")
+	input, _ = reader.ReadString('\n')
+	params.Password = strings.TrimSpace(input)
+
+	// 单包大小限制不可更改，保持原计划，且单包留空时自动等于总交付量
+	if len(plan.Episodes) > 0 {
+		totalMB := int(plan.TotalNewSize / 1024 / 1024)
+		if plan.Episodes[0].TotalSize == 0 {
+			params.PackageSizeLimitMB = totalMB
+		} else {
+			params.PackageSizeLimitMB = int(plan.Episodes[0].TotalSize / 1024 / 1024)
+		}
+	}
+
+	return params
+}
+
+// AskForDeliveryParams 交互式获取首次交付参数，单包留空时自动等于总交付量
+func AskForDeliveryParams(stats interface{}, reader *bufio.Reader) *DeliveryParams {
+	params := &DeliveryParams{}
+	fmt.Println("\n=== 交付参数设置 ===")
+
+	// 交付路径
+	fmt.Print("请输入交付包保存路径 (回车使用默认): ")
+	input, _ := reader.ReadString('\n')
+	params.DeliveryPath = strings.TrimSpace(input)
+	if params.DeliveryPath == "" {
+		params.DeliveryPath = "./delivery"
+	}
+
+	// 包大小限制
+	var totalSize float64
+	if s, ok := stats.(struct{ TotalSize int64 }); ok {
+		totalSize = float64(s.TotalSize)
+	}
+	fmt.Printf("总文件大小: %.2f MB\n", totalSize/1024/1024)
+	fmt.Print("请输入单个包大小限制 (MB, 回车表示不分割): ")
+	input, _ = reader.ReadString('\n')
+	if size, err := strconv.Atoi(strings.TrimSpace(input)); err == nil && size > 0 {
+		params.PackageSizeLimitMB = size
+	} else {
+		params.PackageSizeLimitMB = int(totalSize / 1024 / 1024) // 留空时自动等于总交付量
+	}
+
+	// 总大小限制
+	fmt.Print("请输入本次交付的总大小限制 (MB, 回车表示无限制): ")
+	input, _ = reader.ReadString('\n')
+	if size, err := strconv.Atoi(strings.TrimSpace(input)); err == nil && size > 0 {
+		params.TotalSizeLimitMB = size
+	} else {
+		params.TotalSizeLimitMB = 0
+	}
+
+	// 压缩级别
+	fmt.Print("请输入压缩级别 (0-9, 回车使用默认0): ")
+	input, _ = reader.ReadString('\n')
+	if level, err := strconv.Atoi(strings.TrimSpace(input)); err == nil && level >= 0 && level <= 9 {
+		params.CompressionLevel = level
+	} else {
+		params.CompressionLevel = 0
+	}
+
+	// 密码
+	fmt.Print("请输入加密密码 (回车表示不加密): ")
+	input, _ = reader.ReadString('\n')
+	params.Password = strings.TrimSpace(input)
+
+	return params
 }

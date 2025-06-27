@@ -1,6 +1,8 @@
 package util
 
 import (
+	"beanckup-cli/internal/packager"
+	"beanckup-cli/internal/types"
 	"fmt"
 	"os"
 	"strings"
@@ -137,4 +139,60 @@ func atoi(s string) int {
 func (pd *ProgressDisplay) Finish() {
 	pd.clearLastLines()
 	pd.lastLineCount = 0
+}
+
+// DisplayDeliveryProgress 显示交付进度表格（完整清屏重绘）
+func DisplayDeliveryProgress(plan *types.Plan, workspaceName string) {
+	fmt.Print("\033[2J\033[H") // 清屏并移动光标到顶部
+	fmt.Printf("=== 交付进度 (会话 S%02d) ===\n", plan.SessionID)
+	fmt.Printf("总文件大小: %.2f MB\n", float64(plan.TotalNewSize)/1024/1024)
+	fmt.Println("\n交付包详情:")
+	for i, episode := range plan.Episodes {
+		status := "待交付"
+		if episode.Status == types.EpisodeStatusInProgress {
+			status = "正在交付"
+		} else if episode.Status == types.EpisodeStatusCompleted {
+			status = "已交付"
+		} else if episode.Status == types.EpisodeStatusExceededLimit {
+			status = "超出总大小限制，等待下轮交付"
+		}
+		packageName := fmt.Sprintf("%s-S%02dE%02d", workspaceName, plan.SessionID, episode.ID)
+		fmt.Printf("  [%d] %s - %.2f MB (%d 个文件) - %s\n",
+			i+1, packageName, float64(episode.TotalSize)/1024/1024, len(episode.Files), status)
+	}
+	// 保证光标在表格最后一行之后，所有交互和提示内容都在表格下方
+	fmt.Printf("\033[%d;0H", 5+len(plan.Episodes))
+}
+
+// UpdateDeliveryProgress 只刷新表格对应行
+func UpdateDeliveryProgress(plan *types.Plan, workspaceName string, episodeIndex int, progress packager.Progress) {
+	currentLine := 4 + episodeIndex
+	fmt.Printf("\033[%d;0H", currentLine)
+	fmt.Print("\033[K")
+	e := &plan.Episodes[episodeIndex]
+	packageName := fmt.Sprintf("%s-S%02dE%02d", workspaceName, plan.SessionID, e.ID)
+	status := fmt.Sprintf("正在交付 %d%%", progress.Percentage)
+	if progress.CurrentFile != "" {
+		parts := strings.Split(progress.CurrentFile, " ")
+		if len(parts) >= 2 {
+			status = fmt.Sprintf("正在交付 %d%% (%s/%d)", progress.Percentage, parts[1], len(e.Files))
+		}
+	}
+	fmt.Printf("  [%d] %s - %.2f MB (%d 个文件) - %s\n",
+		episodeIndex+1, packageName, float64(e.TotalSize)/1024/1024, len(e.Files), status)
+	// 保证光标在表格最后一行之后
+	fmt.Printf("\033[%d;0H", 4+len(plan.Episodes))
+}
+
+// UpdateDeliveryStatus 只刷新表格对应行
+func UpdateDeliveryStatus(plan *types.Plan, workspaceName string, episodeIndex int, status string) {
+	currentLine := 4 + episodeIndex
+	fmt.Printf("\033[%d;0H", currentLine)
+	fmt.Print("\033[K")
+	e := &plan.Episodes[episodeIndex]
+	packageName := fmt.Sprintf("%s-S%02dE%02d", workspaceName, plan.SessionID, e.ID)
+	fmt.Printf("  [%d] %s - %.2f MB (%d 个文件) - %s\n",
+		episodeIndex+1, packageName, float64(e.TotalSize)/1024/1024, len(e.Files), status)
+	// 保证光标在表格最后一行之后
+	fmt.Printf("\033[%d;0H", 4+len(plan.Episodes))
 }
