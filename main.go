@@ -220,7 +220,7 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 			}
 
 			packageManifest := manifest.CreateManifest(workspaceName, currentPlan.SessionID, episode.ID, episodePackageName, filesForPackageManifest)
-			
+
 			// 修复：直接使用 episode.Files 作为需要物理打包的文件列表。
 			// 这个列表在 session.CreatePlan 中已经被正确地分离出来了。
 			filesToPack := episode.Files
@@ -363,6 +363,7 @@ func askForDeliveryParams(totalNewSizeBytes int64) *session.DeliveryParams {
 	fmt.Print("请输入交付包保存路径 (回车使用默认: ./delivery): ")
 	input, _ := localReader.ReadString('\n')
 	params.DeliveryPath = strings.TrimSpace(input)
+	params.DeliveryPath = strings.Trim(params.DeliveryPath, "\"")
 	if params.DeliveryPath == "" {
 		params.DeliveryPath = "./delivery"
 	}
@@ -411,6 +412,7 @@ func askForResumeDeliveryParams() *session.DeliveryParams {
 	fmt.Print("请输入交付包保存路径 (回车使用默认: ./delivery): ")
 	input, _ := localReader.ReadString('\n')
 	params.DeliveryPath = strings.TrimSpace(input)
+	params.DeliveryPath = strings.Trim(params.DeliveryPath, "\"")
 	if params.DeliveryPath == "" {
 		params.DeliveryPath = "./delivery"
 	}

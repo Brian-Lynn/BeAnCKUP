@@ -7,7 +7,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Indexer 负责扫描工作区并根据历史记录对文件进行分类。
@@ -15,32 +18,84 @@ type Indexer struct {
 	history *types.HistoricalState
 }
 
+// Job 包含一个要处理的文件路径及其文件信息
+type Job struct {
+	Path string
+	Info os.FileInfo
+}
+
+// Result 包含处理后的文件节点和任何可能发生的错误
+type Result struct {
+	Node *types.FileNode
+	Err  error
+}
+
 // NewIndexer 创建一个新的 Indexer 实例。
 func NewIndexer(history *types.HistoricalState) *Indexer {
 	return &Indexer{history: history}
 }
 
-// ScanWithProgress 递归扫描工作区路径，支持进度回调
+// ScanWithProgress 使用生产者-消费者模型并行扫描文件，以提高I/O和CPU效率。
 func (idx *Indexer) ScanWithProgress(workspacePath string, progressCallback func(string)) ([]*types.FileNode, error) {
 	var allNodes []*types.FileNode
 	var filesToScan []string
 
+	// 1. 生产者准备：预扫描以获取文件总数，用于进度条
 	filepath.Walk(workspacePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			return nil
 		}
 		if !info.IsDir() {
 			if strings.Contains(path, ".beanckup") || strings.EqualFold(info.Name(), "Thumbs.db") {
 				return nil
 			}
 			filesToScan = append(filesToScan, path)
+		} else if info.IsDir() && info.Name() == ".beanckup" {
+			return filepath.SkipDir
 		}
 		return nil
 	})
 
 	totalFiles := len(filesToScan)
-	processedFiles := 0
+	if totalFiles == 0 {
+		// 如果没有文件需要扫描，直接返回空列表
+		return allNodes, nil
+	}
 
+	var processedFiles int64 // 使用原子操作保证多协程计数的线程安全
+
+	// 2. 创建通道和等待组
+	jobs := make(chan Job, totalFiles)
+	results := make(chan Result, totalFiles)
+	var wg sync.WaitGroup
+
+	// 3. 启动消费者（Workers），数量根据CPU核心数决定
+	numWorkers := runtime.NumCPU()
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				relPath, err := filepath.Rel(workspacePath, job.Path)
+				if err != nil {
+					results <- Result{Err: fmt.Errorf("无法获取相对路径: %w", err)}
+					continue
+				}
+				relPath = filepath.ToSlash(relPath)
+
+				node := idx.classifyFile(workspacePath, relPath, job.Info)
+				results <- Result{Node: node}
+
+				// 在worker中安全地更新进度
+				currentProgress := atomic.AddInt64(&processedFiles, 1)
+				progress := fmt.Sprintf("扫描进度: %d/%d 文件 (%.1f%%) - %s",
+					currentProgress, totalFiles, float64(currentProgress)/float64(totalFiles)*100, relPath)
+				progressCallback(progress)
+			}
+		}()
+	}
+
+	// 4. 生产者：遍历文件系统，将任务放入 jobs 通道
 	err := filepath.Walk(workspacePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -51,71 +106,82 @@ func (idx *Indexer) ScanWithProgress(workspacePath string, progressCallback func
 		if path == workspacePath {
 			return nil
 		}
-		if !info.IsDir() && strings.EqualFold(info.Name(), "Thumbs.db") {
-			return nil
-		}
 
-		relPath, err := filepath.Rel(workspacePath, path)
-		if err != nil {
-			return fmt.Errorf("无法获取相对路径: %w", err)
-		}
-		relPath = filepath.ToSlash(relPath)
-
-		node := idx.classifyFile(workspacePath, relPath, info)
-		allNodes = append(allNodes, node)
-
-		if !info.IsDir() {
-			processedFiles++
-			progress := fmt.Sprintf("扫描进度: %d/%d 文件 (%.1f%%) - %s",
-				processedFiles, totalFiles, float64(processedFiles)/float64(totalFiles)*100, relPath)
-			progressCallback(progress)
+		if info.IsDir() {
+			// 目录节点直接在主协程处理，因为它们不涉及耗时操作
+			relPath, _ := filepath.Rel(workspacePath, path)
+			relPath = filepath.ToSlash(relPath)
+			allNodes = append(allNodes, &types.FileNode{Dir: relPath, ModTime: info.ModTime().UTC()})
+		} else {
+			// 文件任务放入通道，交由worker处理
+			if !strings.EqualFold(info.Name(), "Thumbs.db") {
+				jobs <- Job{Path: path, Info: info}
+			}
 		}
 		return nil
 	})
 
+	close(jobs) // 所有任务已发送完毕，关闭通道
+
 	if err != nil {
+		// 如果遍历文件出错，要确保能正常退出
+		wg.Wait()
+		close(results)
 		return nil, err
 	}
+
+	// 5. 收集结果：启动一个协程等待所有worker完成，然后关闭结果通道
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// 在主协程中安全地收集所有结果
+	for result := range results {
+		if result.Err != nil {
+			log.Printf("扫描中发生错误: %v", result.Err)
+			continue
+		}
+		if result.Node != nil {
+			allNodes = append(allNodes, result.Node)
+		}
+	}
+
 	return allNodes, nil
 }
 
-// classifyFile 对单个文件或目录进行分类，并确定其引用关系。
+// classifyFile 函数的逻辑保持不变，它现在被 worker 并发调用
 func (idx *Indexer) classifyFile(workspaceRoot, relPath string, info os.FileInfo) *types.FileNode {
-	if info.IsDir() {
-		return &types.FileNode{Dir: relPath, ModTime: info.ModTime().UTC()}
-	}
+	fullPath := filepath.Join(workspaceRoot, relPath)
 
 	node := &types.FileNode{Path: relPath, Size: info.Size(), ModTime: info.ModTime().UTC()}
-	cTime, err := util.GetCreationTime(filepath.Join(workspaceRoot, relPath))
+	cTime, err := util.GetCreationTime(fullPath)
 	if err == nil {
 		node.CreateTime = cTime.UTC()
 	}
 
-	// 1. 五元预筛
+	// 五元预筛
 	if lastState, ok := idx.history.PathToNode[relPath]; ok &&
 		!lastState.IsDirectory() && lastState.Size == node.Size &&
 		lastState.ModTime.Equal(node.ModTime) && lastState.CreateTime.Equal(node.CreateTime) {
 		node.Hash = lastState.Hash
-		node.Reference = lastState.Reference // 继承完整的引用
+		node.Reference = lastState.Reference
 		return node
 	}
 
-	// 2. 计算哈希
-	hash, err := util.CalculateSHA256(filepath.Join(workspaceRoot, relPath))
+	// 计算哈希
+	hash, err := util.CalculateSHA256(fullPath)
 	if err != nil {
 		log.Printf("警告: 无法计算哈希 %s: %v. 将其视为新文件。", relPath, err)
-		node.Reference = "" // 标记为新文件
+		node.Reference = ""
 		return node
 	}
 	node.Hash = hash
 
-	// 3. 哈希比对
+	// 哈希比对
 	if originalNode, ok := idx.history.HashToNode[hash]; ok {
-		// 哈希存在，说明是移动/重命名或未变更但元数据变动的文件
-		// 继承其最原始的引用信息
 		node.Reference = originalNode.Reference
 	} else {
-		// 哈希不存在，是真正的新文件，reference 留空，待打包时确定
 		node.Reference = ""
 	}
 
