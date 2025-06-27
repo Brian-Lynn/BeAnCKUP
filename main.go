@@ -207,7 +207,7 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 			// --- 核心Manifest逻辑 ---
 			episodePackageName := manifest.GeneratePackageName(workspaceName, currentPlan.SessionID, episode.ID)
 			filesForPackageManifest := []*types.FileNode{}
-			
+
 			for _, fileNode := range episode.Files {
 				if fileNode.Reference == "" { // 这是一个新文件
 					fileNode.Reference = fmt.Sprintf("%s/%s", episodePackageName, fileNode.Path)
@@ -218,9 +218,12 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 			if episode.ID == 1 {
 				filesForPackageManifest = append(filesForPackageManifest, types.FilterReferenceFiles(currentPlan.AllNodes)...)
 			}
-			
+
 			packageManifest := manifest.CreateManifest(workspaceName, currentPlan.SessionID, episode.ID, episodePackageName, filesForPackageManifest)
-			filesToPack := types.FilterNewFiles(filesForPackageManifest)
+			
+			// 修复：直接使用 episode.Files 作为需要物理打包的文件列表。
+			// 这个列表在 session.CreatePlan 中已经被正确地分离出来了。
+			filesToPack := episode.Files
 			// --- 核心Manifest逻辑结束 ---
 
 			pkg := packager.NewPackager()
@@ -229,7 +232,7 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 				currentParams.DeliveryPath,
 				packageManifest,
 				workspacePath,
-				filesToPack, // 只打包物理上是新的文件
+				filesToPack, // 修复：传入正确的文件列表
 				currentParams.Password,
 				currentParams.CompressionLevel,
 				func(p packager.Progress) {
@@ -321,7 +324,6 @@ func analyzeFileChanges(allNodes []*types.FileNode, histState *types.HistoricalS
 			newCount++
 			newSize += node.Size
 		} else {
-			// 如果一个文件的引用存在，但其当前路径不在历史记录中，则视为移动
 			if _, exists := historicalFilesByPath[node.Path]; !exists {
 				movedCount++
 			}
@@ -329,9 +331,7 @@ func analyzeFileChanges(allNodes []*types.FileNode, histState *types.HistoricalS
 	}
 
 	for path, histNode := range historicalFilesByPath {
-		// 如果历史文件路径在当前找不到
 		if _, exists := currentFilesByPath[path]; !exists {
-			// 检查它的哈希是否还在（即文件是否被移动而不是删除）
 			isMoved := false
 			for _, currentNode := range allNodes {
 				if currentNode.Hash == histNode.Hash {
@@ -463,7 +463,8 @@ func handleRestore() {
 	}
 	fmt.Printf("\n发现 %d 个备份记录:\n", len(sessions))
 	for i, session := range sessions {
-		res.LoadSessionManifests(session, "")
+		// 修复：改为调用 LoadManifestsForSession
+		res.LoadManifestsForSession(session, "")
 		fmt.Printf("  [%d] S%02d - %s\n",
 			i+1,
 			session.SessionID,
@@ -482,7 +483,8 @@ func handleRestore() {
 	password, _ := reader.ReadString('\n')
 	password = strings.TrimSpace(password)
 	fmt.Printf("\n正在加载 S%02d 的清单文件...\n", selectedSession.SessionID)
-	err = res.LoadSessionManifests(selectedSession, password)
+	// 修复：改为调用 LoadManifestsForSession
+	err = res.LoadManifestsForSession(selectedSession, password)
 	if err != nil {
 		log.Printf("错误: 加载清单文件失败: %v\n", err)
 		return

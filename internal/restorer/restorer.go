@@ -64,7 +64,7 @@ func (r *Restorer) DiscoverDeliverySessions() ([]*DeliverySession, error) {
 }
 
 // LoadSessionManifests 为指定会话加载所需的所有历史清单
-func (r *Restorer) LoadSessionManifests(session *DeliverySession, password string) error {
+func (r *Restorer) LoadManifestsForSession(session *DeliverySession, password string) error {
 	var targetManifests []*types.Manifest
 	var historicalManifests []*types.Manifest
 	var firstTimestamp time.Time
@@ -74,7 +74,9 @@ func (r *Restorer) LoadSessionManifests(session *DeliverySession, password strin
 		if sessionID > 0 && sessionID <= session.SessionID {
 			m, err := r.extractManifestFromPackage(packagePath, password)
 			if err != nil {
-				return fmt.Errorf("从包 %s 提取清单失败: %w", packageName, err)
+				// 如果一个包的清单提取失败（例如，密码错误），打印警告但继续尝试其他包
+				fmt.Printf("警告: 从包 %s 提取清单失败: %v\n", packageName, err)
+				continue
 			}
 			historicalManifests = append(historicalManifests, m)
 			if sessionID == session.SessionID {
@@ -88,8 +90,9 @@ func (r *Restorer) LoadSessionManifests(session *DeliverySession, password strin
 		}
 	}
 
+	// 只有在成功加载了目标会话至少一个清单后，才认为加载成功
 	if len(targetManifests) == 0 {
-		return fmt.Errorf("未能为会话 S%02d 加载任何清单文件", session.SessionID)
+		return fmt.Errorf("未能为会话 S%02d 加载任何有效的清单文件", session.SessionID)
 	}
 
 	session.Timestamp = firstTimestamp
