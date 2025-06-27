@@ -88,9 +88,10 @@ type HistoricalState struct {
 type EpisodeStatus string
 
 const (
-	EpisodeStatusPending    EpisodeStatus = "PENDING"
-	EpisodeStatusInProgress EpisodeStatus = "IN_PROGRESS"
-	EpisodeStatusCompleted  EpisodeStatus = "COMPLETED"
+	EpisodeStatusPending       EpisodeStatus = "PENDING"
+	EpisodeStatusInProgress    EpisodeStatus = "IN_PROGRESS"
+	EpisodeStatusCompleted     EpisodeStatus = "COMPLETED"
+	EpisodeStatusExceededLimit EpisodeStatus = "EXCEEDED_LIMIT" // 超出总大小限制
 )
 
 // Episode 代表一个具体的交付包计划
@@ -125,6 +126,17 @@ func (p *Plan) CountPending() int {
 	count := 0
 	for _, ep := range p.Episodes {
 		if ep.Status == EpisodeStatusPending || ep.Status == EpisodeStatusInProgress {
+			count++
+		}
+	}
+	return count
+}
+
+// CountExceededLimit 统计有多少个超出总大小限制的包
+func (p *Plan) CountExceededLimit() int {
+	count := 0
+	for _, ep := range p.Episodes {
+		if ep.Status == EpisodeStatusExceededLimit {
 			count++
 		}
 	}

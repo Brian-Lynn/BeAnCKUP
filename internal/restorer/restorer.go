@@ -35,6 +35,14 @@ type PackageInfo struct {
 	Timestamp   string
 }
 
+// FileToRestore 包含恢复单个文件所需的所有信息
+type FileToRestore struct {
+	Node              *types.FileNode // 来自原始 manifest 的文件节点
+	SourcePackageName string          // 文件来源的包名
+	SourceFilePath    string          // 文件在源包中的完整路径
+	FinalPath         string          // 文件恢复后的最终绝对路径（包括重命名）
+}
+
 func NewRestorer(deliveryDir string) (*Restorer, error) {
 	return &Restorer{
 		deliveryDir: deliveryDir,
@@ -49,51 +57,75 @@ func (r *Restorer) DiscoverDeliverySessions() ([]*DeliverySession, error) {
 
 	fmt.Printf("开始搜索交付包目录: %s\n", r.deliveryDir)
 
-	// 递归搜索交付包目录
-	err := filepath.Walk(r.deliveryDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	// 只遍历一层目录和文件
+	entries, err := os.ReadDir(r.deliveryDir)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取目录: %w", err)
+	}
 
-		// 只处理.7z文件
-		if !info.IsDir() && strings.HasSuffix(info.Name(), ".7z") {
-			packagePath := path
-			packageName := info.Name()
-
+	for _, entry := range entries {
+		path := filepath.Join(r.deliveryDir, entry.Name())
+		if entry.IsDir() {
+			// 只遍历一层子目录
+			subEntries, err := os.ReadDir(path)
+			if err != nil {
+				if os.IsPermission(err) {
+					fmt.Printf("跳过无权限目录或文件: %s\n", path)
+					continue
+				}
+				return nil, err
+			}
+			for _, subEntry := range subEntries {
+				subPath := filepath.Join(path, subEntry.Name())
+				if !subEntry.IsDir() && strings.HasSuffix(subEntry.Name(), ".7z") {
+					packageName := subEntry.Name()
+					fmt.Printf("发现包文件: %s\n", packageName)
+					// 尝试从包名解析会话信息
+					sessionID, episodeID, err := parsePackageName(packageName)
+					if err != nil {
+						fmt.Printf("跳过无法解析的包: %s (错误: %v)\n", packageName, err)
+						continue
+					}
+					fmt.Printf("解析成功: %s -> S%02dE%02d\n", packageName, sessionID, episodeID)
+					r.packages[packageName] = subPath
+					session, exists := sessionMap[sessionID]
+					if !exists {
+						session = &DeliverySession{
+							SessionID:    sessionID,
+							Timestamp:    time.Now(),
+							Manifests:    []*types.Manifest{},
+							PackagePath:  filepath.Dir(subPath),
+							AllManifests: make(map[string]*types.Manifest),
+						}
+						sessionMap[sessionID] = session
+						fmt.Printf("创建新会话: S%02d\n", sessionID)
+					}
+				}
+			}
+		} else if strings.HasSuffix(entry.Name(), ".7z") {
+			packageName := entry.Name()
 			fmt.Printf("发现包文件: %s\n", packageName)
-
 			// 尝试从包名解析会话信息
 			sessionID, episodeID, err := parsePackageName(packageName)
 			if err != nil {
 				fmt.Printf("跳过无法解析的包: %s (错误: %v)\n", packageName, err)
-				return nil // 跳过无法解析的包
+				continue
 			}
-
 			fmt.Printf("解析成功: %s -> S%02dE%02d\n", packageName, sessionID, episodeID)
-
-			// 记录包信息
-			r.packages[packageName] = packagePath
-
-			// 创建或更新会话
+			r.packages[packageName] = path
 			session, exists := sessionMap[sessionID]
 			if !exists {
 				session = &DeliverySession{
 					SessionID:    sessionID,
-					Timestamp:    time.Now(), // 临时时间，稍后从清单更新
+					Timestamp:    time.Now(),
 					Manifests:    []*types.Manifest{},
-					PackagePath:  filepath.Dir(packagePath),
+					PackagePath:  filepath.Dir(path),
 					AllManifests: make(map[string]*types.Manifest),
 				}
 				sessionMap[sessionID] = session
 				fmt.Printf("创建新会话: S%02d\n", sessionID)
 			}
 		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("搜索交付包失败: %w", err)
 	}
 
 	fmt.Printf("发现 %d 个会话\n", len(sessionMap))
@@ -255,7 +287,7 @@ func parsePackageName(packageName string) (sessionID, episodeID int, err error) 
 	return sessionID, episodeID, nil
 }
 
-// RestoreFromSession 从指定会话恢复文件
+// RestoreFromSession 从指定会话恢复文件（采用7z命令行批处理模式）
 func (r *Restorer) RestoreFromSession(session *DeliverySession, restorePath, password string) error {
 	if len(session.Manifests) == 0 {
 		return fmt.Errorf("会话无清单文件")
@@ -278,102 +310,122 @@ func (r *Restorer) RestoreFromSession(session *DeliverySession, restorePath, pas
 		fmt.Printf("警告: 无法创建 .beanckup 目录: %v\n", err)
 	} else {
 		for packageName, packagePath := range r.packages {
-			// 只处理已加载到的包
 			if _, loaded := session.AllManifests[packageName]; !loaded {
 				continue
 			}
-			// 生成manifest文件名
-			baseName := packageName[:len(packageName)-3] // 去掉.7z
+			baseName := strings.TrimSuffix(packageName, ".7z")
 			manifestFilename := baseName + ".json"
 			manifestPathInPackage := ".beanckup/" + manifestFilename
-			args := []string{
-				"e",
-				packagePath,
-				manifestPathInPackage,
-				"-o" + beanckupDir,
-				"-y",
+			args := []string{"e", packagePath, "-o" + beanckupDir, manifestPathInPackage, "-y"}
+			if password != "" {
+				args = append(args, "-p"+password)
 			}
 			cmd := exec.Command("7z", args...)
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				fmt.Printf("警告: 解压manifest清单 '%s' 失败: %v\nOutput: %s\n", manifestPathInPackage, err, string(output))
+			if output, err := cmd.CombinedOutput(); err != nil {
+				fmt.Printf("警告: 解压 manifest '%s' 失败: %v\nOutput: %s\n", manifestPathInPackage, err, string(output))
 			}
 		}
 	}
 
-	// 收集所有需要恢复的文件
+	// 1. 收集所有需要恢复的文件，并按源包分组
+	filesToRestoreByPackage := make(map[string][]*FileToRestore)
 	allFiles := make(map[string]*types.FileNode)
-	// 从所有清单中收集文件
 	for _, manifest := range session.Manifests {
 		for _, node := range manifest.Files {
-			key := node.GetPath()
 			if !node.IsDirectory() {
-				allFiles[key] = node
+				allFiles[node.GetPath()] = node
 			}
 		}
 	}
 	fmt.Printf("发现 %d 个文件需要恢复\n", len(allFiles))
-
-	// 恢复每个文件
 	for path, node := range allFiles {
-		if node.IsDirectory() {
-			dirPath := filepath.Join(fullRestorePath, node.Dir)
-			os.MkdirAll(dirPath, 0755)
-			os.Chtimes(dirPath, node.ModTime, node.CreateTime)
-			continue
-		}
 		sourcePackageName, sourceFilePathInPackage, err := r.findSourceFileInSession(session, node, password)
 		if err != nil {
 			fmt.Printf("警告: 无法定位源文件 '%s': %v\n", path, err)
 			continue
 		}
-		sourcePackagePath := r.packages[sourcePackageName]
-		if sourcePackagePath == "" {
-			fmt.Printf("警告: 无法找到包文件 '%s'\n", sourcePackageName)
+		if _, ok := filesToRestoreByPackage[sourcePackageName]; !ok {
+			filesToRestoreByPackage[sourcePackageName] = []*FileToRestore{}
+		}
+		filesToRestoreByPackage[sourcePackageName] = append(filesToRestoreByPackage[sourcePackageName], &FileToRestore{
+			Node:              node,
+			SourcePackageName: sourcePackageName,
+			SourceFilePath:    sourceFilePathInPackage,
+			FinalPath:         filepath.Join(fullRestorePath, path),
+		})
+	}
+
+	// 2. 遍历每个包，执行批量解压和重命名
+	for packageName, filesToRestore := range filesToRestoreByPackage {
+		sourcePackagePath, ok := r.packages[packageName]
+		if !ok {
+			fmt.Printf("警告: 无法找到包文件 '%s' 的路径，跳过\n", packageName)
 			continue
 		}
-		fmt.Printf("正在解压: %s (来自 %s)\n", path, sourcePackageName)
-		targetDir := filepath.Join(fullRestorePath, filepath.Dir(path))
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
-			fmt.Printf("警告: 无法创建目录 '%s': %v\n", targetDir, err)
+
+		fmt.Printf("\n正在处理包: %s (%d 个文件)\n", packageName, len(filesToRestore))
+
+		// 创建临时解压目录
+		tempExtractDir := filepath.Join(os.TempDir(), fmt.Sprintf("beanckup_restore_%d", hashString(packageName)))
+		if err := os.MkdirAll(tempExtractDir, 0755); err != nil {
+			fmt.Printf("警告: 创建临时目录 '%s' 失败: %v\n", tempExtractDir, err)
 			continue
 		}
-		// 解压文件到正确的位置，使用7z e，不保留包内目录结构
-		args := []string{
-			"e", // 只解压文件，不保留目录结构
-			sourcePackagePath,
-			"-o" + targetDir, // 直接解压到目标目录
-			sourceFilePathInPackage,
-			"-y", // 全部选是
+		defer os.RemoveAll(tempExtractDir)
+
+		// 创建临时文件列表
+		tempListFile := filepath.Join(tempExtractDir, "filelist.txt")
+		file, err := os.Create(tempListFile)
+		if err != nil {
+			fmt.Printf("警告: 创建临时文件列表 '%s' 失败: %v\n", tempListFile, err)
+			continue
 		}
+		for _, ftr := range filesToRestore {
+			_, _ = file.WriteString(ftr.SourceFilePath + "\n")
+		}
+		file.Close()
+
+		// 执行7z批量解压
+		fmt.Printf("  -> 批量解压到临时目录: %s\n", tempExtractDir)
+		args := []string{"x", sourcePackagePath, "-o" + tempExtractDir, "-aoa", "@" + tempListFile}
 		if password != "" {
 			args = append(args, "-p"+password)
 		}
-
 		cmd := exec.Command("7z", args...)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			fmt.Printf("警告: 解压文件 '%s' 失败: %v\nOutput: %s\n", sourceFilePathInPackage, err, string(output))
+		if output, err := cmd.CombinedOutput(); err != nil {
+			fmt.Printf("警告: 7z 批量解压失败 for package '%s': %v\nOutput: %s\n", packageName, err, string(output))
 			continue
 		}
 
-		// 检查文件是否在目标目录
-		fileName := filepath.Base(sourceFilePathInPackage)
-		actualPath := filepath.Join(targetDir, fileName)
-		if _, err := os.Stat(actualPath); err != nil {
-			fmt.Printf("警告: 解压后未找到文件: %s\n", actualPath)
-			continue
-		}
+		// 移动并重命名文件
+		fmt.Println("  -> 移动并重命名文件到最终位置...")
+		for _, ftr := range filesToRestore {
+			tempPath := filepath.Join(tempExtractDir, ftr.SourceFilePath)
+			finalPath := ftr.FinalPath
 
-		// 如果目标路径和实际路径不一致，移动到manifest指定的最终位置
-		expectedPath := filepath.Join(fullRestorePath, path)
-		if actualPath != expectedPath {
-			if err := os.Rename(actualPath, expectedPath); err != nil {
-				fmt.Printf("警告: 无法移动文件从 '%s' 到 '%s': %v\n", actualPath, expectedPath, err)
+			if _, err := os.Stat(tempPath); os.IsNotExist(err) {
+				fmt.Printf("警告: 临时解压文件 '%s' 不存在，跳过\n", tempPath)
+
+				continue
+			}
+
+			// 确保最终目标目录存在
+			finalDir := filepath.Dir(finalPath)
+			if err := os.MkdirAll(finalDir, 0755); err != nil {
+				fmt.Printf("警告: 无法创建最终目录 '%s': %v\n", finalDir, err)
+				continue
+			}
+
+			// 执行移动和重命名
+			if err := os.Rename(tempPath, finalPath); err != nil {
+				fmt.Printf("警告: 无法移动/重命名文件从 '%s' 到 '%s': %v\n", tempPath, finalPath, err)
+
 				continue
 			}
 		}
 	}
+
+	fmt.Println("\n恢复完成。")
 	return nil
 }
 
@@ -462,4 +514,14 @@ func isPackageNameMatch(refPackage, packageName string) bool {
 	}
 
 	return refSessionID == pkgSessionID && refEpisodeID == pkgEpisodeID
+}
+
+// hashString 用于为临时目录生成唯一的名称
+func hashString(s string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h = h ^ uint32(s[i])
+		h = h * 16777619
+	}
+	return h
 }

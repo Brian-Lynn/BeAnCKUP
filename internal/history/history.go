@@ -19,9 +19,12 @@ func LoadHistoricalState(beanckupDir string) (*types.HistoricalState, error) {
 		MaxSessionID:     0,
 	}
 
+	fmt.Printf("DEBUG: 正在检查目录: %s\n", beanckupDir)
+
 	entries, err := os.ReadDir(beanckupDir)
 	if err != nil {
 		if os.IsNotExist(err) {
+			fmt.Printf("DEBUG: 目录不存在: %s\n", beanckupDir)
 			return state, nil // 目录不存在，返回空状态
 		}
 		return nil, fmt.Errorf("无法读取 .beanckup 目录: %w", err)
@@ -37,6 +40,7 @@ func LoadHistoricalState(beanckupDir string) (*types.HistoricalState, error) {
 
 	// 显示排序后的文件列表
 	for _, entry := range entries {
+		fmt.Printf("DEBUG: 发现文件: %s (目录: %v)\n", entry.Name(), entry.IsDir())
 		if strings.HasSuffix(entry.Name(), ".json") {
 			fmt.Printf("  发现清单文件: %s\n", entry.Name())
 		}

@@ -22,13 +22,44 @@ func NewIndexer(history *types.HistoricalState) *Indexer {
 
 // Scan 递归扫描工作区路径，并返回一个包含所有已分类文件节点的扁平列表。
 func (idx *Indexer) Scan(workspacePath string) ([]*types.FileNode, error) {
+	return idx.ScanWithProgress(workspacePath, nil)
+}
+
+// ScanWithProgress 递归扫描工作区路径，支持进度回调
+func (idx *Indexer) ScanWithProgress(workspacePath string, progressCallback func(string)) ([]*types.FileNode, error) {
 	var allNodes []*types.FileNode
+	var totalFiles int
+	var processedFiles int
 
 	absWorkspacePath, err := filepath.Abs(workspacePath)
 	if err != nil {
 		return nil, fmt.Errorf("无法获取绝对路径: %w", err)
 	}
 
+	// 首先计算总文件数
+	if progressCallback != nil {
+		err = filepath.Walk(absWorkspacePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() && info.Name() == ".beanckup" {
+				return filepath.SkipDir
+			}
+			// 过滤Thumbs.db文件
+			if !info.IsDir() && strings.EqualFold(info.Name(), "Thumbs.db") {
+				return nil // 跳过Thumbs.db文件
+			}
+			if !info.IsDir() {
+				totalFiles++
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 实际扫描和分类
 	err = filepath.Walk(absWorkspacePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -40,6 +71,11 @@ func (idx *Indexer) Scan(workspacePath string) ([]*types.FileNode, error) {
 			return nil
 		}
 
+		// 过滤Thumbs.db文件
+		if !info.IsDir() && strings.EqualFold(info.Name(), "Thumbs.db") {
+			return nil // 跳过Thumbs.db文件
+		}
+
 		relPath, err := filepath.Rel(absWorkspacePath, path)
 		if err != nil {
 			return fmt.Errorf("无法获取相对路径: %w", err)
@@ -48,6 +84,15 @@ func (idx *Indexer) Scan(workspacePath string) ([]*types.FileNode, error) {
 
 		node := idx.classifyFile(absWorkspacePath, relPath, info)
 		allNodes = append(allNodes, node)
+
+		// 更新进度
+		if progressCallback != nil && !info.IsDir() {
+			processedFiles++
+			progress := fmt.Sprintf("扫描进度: %d/%d 文件 (%.1f%%) - %s",
+				processedFiles, totalFiles, float64(processedFiles)/float64(totalFiles)*100, relPath)
+			progressCallback(progress)
+		}
+
 		return nil
 	})
 
