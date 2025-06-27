@@ -82,9 +82,9 @@ func handleScanAndDeliver() {
 		return
 	}
 
-	if plan != nil {
-		fmt.Printf("\n⚠️  发现未完成的交付任务 (会话 S%02d, 还有 %d 个包待交付)\n",
-			plan.SessionID, plan.CountPending())
+	if plan != nil && !plan.IsCompleted() {
+		fmt.Printf("\n⚠️  发现未完成的交付任务 (会话 S%d, 还有 %d 个包未完成)\n",
+			plan.SessionID, plan.CountUnfinished())
 		util.DisplayDeliveryProgress(plan, workspaceName)
 		fmt.Println("\n选项:")
 		fmt.Println("1. 继续未完成的交付")
@@ -118,7 +118,7 @@ func handleScanAndDeliver() {
 	if histState.MaxSessionID == 0 && len(histState.PathToNode) == 0 {
 		fmt.Println("首次扫描，将创建新的备份历史")
 	} else {
-		fmt.Printf("检测到历史记录，最大会话ID: S%02d\n", histState.MaxSessionID)
+		fmt.Printf("检测到历史记录，最大会话ID: S%d\n", histState.MaxSessionID)
 	}
 
 	fmt.Println("\n=== 开始扫描工作区 ===")
@@ -155,8 +155,9 @@ func handleScanAndDeliver() {
 
 	newSessionID := histState.MaxSessionID + 1
 	newPlan := session.CreatePlan(newSessionID, allNodes, params.PackageSizeLimitMB)
+	session.ApplyTotalSizeLimitToPlan(newPlan, params.TotalSizeLimitMB)
 
-	if len(newPlan.Episodes) == 0 && movedCount == 0 {
+	if len(newPlan.Episodes) == 0 || newPlan.CountPending() == 0 {
 		fmt.Println("根据您的设置，本次扫描未计划任何交付包。")
 		return
 	}
@@ -170,20 +171,34 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 	currentParams := params
 
 	for {
-		session.CleanupIncompletePackages(currentParams.DeliveryPath, currentPlan, workspaceName)
-		session.ApplyTotalSizeLimitToPlan(currentPlan, currentParams.TotalSizeLimitMB)
+		runLimitBytes := int64(currentParams.TotalSizeLimitMB) * 1024 * 1024
+		var sizeScheduledForThisRun int64
+		for i := range currentPlan.Episodes {
+			episode := &currentPlan.Episodes[i]
+			if episode.Status == types.EpisodeStatusCompleted {
+				continue
+			}
+			if runLimitBytes == 0 || (sizeScheduledForThisRun+episode.TotalSize <= runLimitBytes) {
+				episode.Status = types.EpisodeStatusPending
+				sizeScheduledForThisRun += episode.TotalSize
+			} else {
+				episode.Status = types.EpisodeStatusExceededLimit
+			}
+		}
+
 		util.DisplayDeliveryProgress(currentPlan, workspaceName)
 
-		if currentPlan.CountPending() == 0 && !currentPlan.IsCompleted() {
-			fmt.Println("\n根据当前总大小限制，没有可交付的任务。")
-		} else if currentPlan.CountPending() > 0 {
+		if currentPlan.CountPending() == 0 {
+			if !currentPlan.IsCompleted() {
+				fmt.Println("\n根据当前总大小限制，没有可交付的任务。")
+			} else {
+				fmt.Println("\n所有交付任务均已完成。")
+			}
+		} else {
 			if !askForConfirmation("是否开始执行交付?") {
 				fmt.Println("取消交付。")
 				return
 			}
-		} else if currentPlan.IsCompleted() {
-			fmt.Println("\n所有交付任务均已完成。")
-			return
 		}
 
 		var deliveryHappened bool
@@ -204,27 +219,21 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 			}
 			currentPlan.StatusFilePath = planFilePath
 
-			// --- 核心Manifest逻辑 ---
 			episodePackageName := manifest.GeneratePackageName(workspaceName, currentPlan.SessionID, episode.ID)
 			filesForPackageManifest := []*types.FileNode{}
 
 			for _, fileNode := range episode.Files {
-				if fileNode.Reference == "" { // 这是一个新文件
+				if fileNode.Reference == "" {
 					fileNode.Reference = fmt.Sprintf("%s/%s", episodePackageName, fileNode.Path)
 				}
 				filesForPackageManifest = append(filesForPackageManifest, fileNode)
 			}
-
 			if episode.ID == 1 {
 				filesForPackageManifest = append(filesForPackageManifest, types.FilterReferenceFiles(currentPlan.AllNodes)...)
 			}
 
 			packageManifest := manifest.CreateManifest(workspaceName, currentPlan.SessionID, episode.ID, episodePackageName, filesForPackageManifest)
-
-			// 修复：直接使用 episode.Files 作为需要物理打包的文件列表。
-			// 这个列表在 session.CreatePlan 中已经被正确地分离出来了。
 			filesToPack := episode.Files
-			// --- 核心Manifest逻辑结束 ---
 
 			pkg := packager.NewPackager()
 			packageProgress := util.NewProgressDisplay()
@@ -232,7 +241,7 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 				currentParams.DeliveryPath,
 				packageManifest,
 				workspacePath,
-				filesToPack, // 修复：传入正确的文件列表
+				filesToPack,
 				currentParams.Password,
 				currentParams.CompressionLevel,
 				func(p packager.Progress) {
@@ -363,7 +372,6 @@ func askForDeliveryParams(totalNewSizeBytes int64) *session.DeliveryParams {
 	fmt.Print("请输入交付包保存路径 (回车使用默认: ./delivery): ")
 	input, _ := localReader.ReadString('\n')
 	params.DeliveryPath = strings.TrimSpace(input)
-	params.DeliveryPath = strings.Trim(params.DeliveryPath, "\"")
 	if params.DeliveryPath == "" {
 		params.DeliveryPath = "./delivery"
 	}
@@ -412,7 +420,6 @@ func askForResumeDeliveryParams() *session.DeliveryParams {
 	fmt.Print("请输入交付包保存路径 (回车使用默认: ./delivery): ")
 	input, _ := localReader.ReadString('\n')
 	params.DeliveryPath = strings.TrimSpace(input)
-	params.DeliveryPath = strings.Trim(params.DeliveryPath, "\"")
 	if params.DeliveryPath == "" {
 		params.DeliveryPath = "./delivery"
 	}
@@ -465,9 +472,9 @@ func handleRestore() {
 	}
 	fmt.Printf("\n发现 %d 个备份记录:\n", len(sessions))
 	for i, session := range sessions {
-		// 修复：改为调用 LoadManifestsForSession
-		res.LoadManifestsForSession(session, "")
-		fmt.Printf("  [%d] S%02d - %s\n",
+		// 修复：确保调用正确的函数名
+		res.LoadSessionManifests(session, "")
+		fmt.Printf("  [%d] S%d - %s\n",
 			i+1,
 			session.SessionID,
 			session.Timestamp.Format("2006-01-02 15:04:05"))
@@ -484,9 +491,9 @@ func handleRestore() {
 	fmt.Print("请输入加密密码 (如果包未加密则留空): ")
 	password, _ := reader.ReadString('\n')
 	password = strings.TrimSpace(password)
-	fmt.Printf("\n正在加载 S%02d 的清单文件...\n", selectedSession.SessionID)
-	// 修复：改为调用 LoadManifestsForSession
-	err = res.LoadManifestsForSession(selectedSession, password)
+	fmt.Printf("\n正在加载 S%d 的清单文件...\n", selectedSession.SessionID)
+	// 修复：确保调用正确的函数名
+	err = res.LoadSessionManifests(selectedSession, password)
 	if err != nil {
 		log.Printf("错误: 加载清单文件失败: %v\n", err)
 		return
@@ -509,8 +516,8 @@ func handleRestore() {
 		if len(selectedSession.Manifests) > 0 {
 			workspaceName = selectedSession.Manifests[0].WorkspaceName
 		}
-		ts := selectedSession.Timestamp.Format("20060102_150405")
-		recoveryDir := fmt.Sprintf("%s_S%02d_%s_Recovery", workspaceName, selectedSession.SessionID, ts)
+		ts := selectedSession.Timestamp.Format("2006-01-02 15:04:05")
+		recoveryDir := fmt.Sprintf("%s_S%d_%s_Recovery", workspaceName, selectedSession.SessionID, ts)
 		finalRestorePath := filepath.Join(restorePath, recoveryDir)
 		fmt.Println("\n✓ 恢复成功！文件已存至:", finalRestorePath)
 	}

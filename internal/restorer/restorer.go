@@ -18,15 +18,13 @@ import (
 
 type Restorer struct {
 	deliveryDir string
-	allPackages map[string]string // 存储发现的所有包名 -> 路径
+	allPackages map[string]string
 }
 
 type DeliverySession struct {
-	SessionID int
-	Timestamp time.Time
-	// Manifests for the target session ONLY
-	Manifests []*types.Manifest
-	// All manifests up to and including the target session
+	SessionID           int
+	Timestamp           time.Time
+	Manifests           []*types.Manifest
 	HistoricalManifests []*types.Manifest
 }
 
@@ -37,7 +35,6 @@ func NewRestorer(deliveryDir string) (*Restorer, error) {
 	}, nil
 }
 
-// DiscoverDeliverySessions 扫描交付目录，发现所有备份会话
 func (r *Restorer) DiscoverDeliverySessions() ([]*DeliverySession, error) {
 	sessionMap := make(map[int]*DeliverySession)
 	filepath.Walk(r.deliveryDir, func(path string, info os.FileInfo, err error) error {
@@ -63,8 +60,8 @@ func (r *Restorer) DiscoverDeliverySessions() ([]*DeliverySession, error) {
 	return sessions, nil
 }
 
-// LoadSessionManifests 为指定会话加载所需的所有历史清单
-func (r *Restorer) LoadManifestsForSession(session *DeliverySession, password string) error {
+// 修复：确保函数名与 main.go 中的调用一致
+func (r *Restorer) LoadSessionManifests(session *DeliverySession, password string) error {
 	var targetManifests []*types.Manifest
 	var historicalManifests []*types.Manifest
 	var firstTimestamp time.Time
@@ -74,9 +71,7 @@ func (r *Restorer) LoadManifestsForSession(session *DeliverySession, password st
 		if sessionID > 0 && sessionID <= session.SessionID {
 			m, err := r.extractManifestFromPackage(packagePath, password)
 			if err != nil {
-				// 如果一个包的清单提取失败（例如，密码错误），打印警告但继续尝试其他包
-				fmt.Printf("警告: 从包 %s 提取清单失败: %v\n", packageName, err)
-				continue
+				return fmt.Errorf("从包 %s 提取清单失败: %w", packageName, err)
 			}
 			historicalManifests = append(historicalManifests, m)
 			if sessionID == session.SessionID {
@@ -90,9 +85,8 @@ func (r *Restorer) LoadManifestsForSession(session *DeliverySession, password st
 		}
 	}
 
-	// 只有在成功加载了目标会话至少一个清单后，才认为加载成功
 	if len(targetManifests) == 0 {
-		return fmt.Errorf("未能为会话 S%02d 加载任何有效的清单文件", session.SessionID)
+		return fmt.Errorf("未能为会话 S%d 加载任何有效的清单文件", session.SessionID)
 	}
 
 	session.Timestamp = firstTimestamp
@@ -134,19 +128,17 @@ func (r *Restorer) extractManifestFromPackage(packagePath, password string) (*ty
 	return &manifest, nil
 }
 
-// RestoreFromSession 从指定会话恢复文件
 func (r *Restorer) RestoreFromSession(session *DeliverySession, restorePath, password string) error {
 	if len(session.Manifests) == 0 {
-		return fmt.Errorf("会话 S%02d 无清单文件", session.SessionID)
+		return fmt.Errorf("会话 S%d 无清单文件", session.SessionID)
 	}
 	workspaceName := session.Manifests[0].WorkspaceName
 	ts := session.Timestamp.Format("20060102_150405")
-	fullRestorePath := filepath.Join(restorePath, fmt.Sprintf("%s_S%02d_%s_Recovery", workspaceName, session.SessionID, ts))
+	fullRestorePath := filepath.Join(restorePath, fmt.Sprintf("%s_S%d_%s_Recovery", workspaceName, session.SessionID, ts))
 	if err := os.MkdirAll(fullRestorePath, 0755); err != nil {
 		return fmt.Errorf("无法创建恢复目录: %w", err)
 	}
 
-	// 1. 恢复 .beanckup 历史清单
 	beanckupDir := filepath.Join(fullRestorePath, ".beanckup")
 	if err := os.MkdirAll(beanckupDir, 0755); err != nil {
 		return fmt.Errorf("无法创建 .beanckup 目录: %w", err)
@@ -158,7 +150,6 @@ func (r *Restorer) RestoreFromSession(session *DeliverySession, restorePath, pas
 		}
 	}
 
-	// 2. 准备恢复最终的文件列表
 	finalFileSet := make(map[string]*types.FileNode)
 	for _, m := range session.Manifests {
 		for _, node := range m.Files {
@@ -167,7 +158,6 @@ func (r *Restorer) RestoreFromSession(session *DeliverySession, restorePath, pas
 	}
 	fmt.Printf("文件将恢复到: %s\n分析完成，共需恢复 %d 个文件。\n", fullRestorePath, len(finalFileSet))
 
-	// 3. 按源包分组
 	filesBySourcePackage := make(map[string][]*types.FileNode)
 	for _, node := range finalFileSet {
 		if node.IsDirectory() { continue }
@@ -180,7 +170,6 @@ func (r *Restorer) RestoreFromSession(session *DeliverySession, restorePath, pas
 		filesBySourcePackage[sourcePackage] = append(filesBySourcePackage[sourcePackage], node)
 	}
 
-	// 4. 按包进行解压和恢复
 	tempBaseDir := filepath.Join(fullRestorePath, ".beanckup_temp_restore")
 	if err := os.MkdirAll(tempBaseDir, 0755); err != nil {
 		return fmt.Errorf("无法创建临时恢复目录: %w", err)
