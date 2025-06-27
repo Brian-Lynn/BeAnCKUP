@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,214 +28,164 @@ func NewPackager() *Packager {
 	return &Packager{}
 }
 
-// CreatePackage 负责创建包含指定文件和特定清单的7z包
+// CreatePackage 使用“直接提货单”模式创建7z包，不再需要临时“集散地”
 func (p *Packager) CreatePackage(
 	deliveryPath string,
-	// 这是随包清单，只包含本包相关文件信息
 	packageManifest *types.Manifest,
 	workspaceRoot string,
-	// 这是实际要打包的新文件列表
 	newFiles []*types.FileNode,
 	password string,
 	compressionLevel int,
 	progressCallback func(Progress),
 ) error {
+	// 确保最终输出目录存在，但我们不会在这里创建任何集散地。
 	if err := os.MkdirAll(deliveryPath, 0755); err != nil {
 		return fmt.Errorf("无法创建交付目录: %w", err)
 	}
 
-	packageFilePath := filepath.Join(deliveryPath, packageManifest.PackageName)
-
-	// 创建临时打包目录
-	tempPackDir, err := os.MkdirTemp("", "beanckup_pack_*")
+	// 1. 在操作系a统的默认临时目录 (通常是本地SSD) 创建一个极小的元数据文件夹。
+	//    这完全符合您的要求：临时文件在本地，不写入输出盘。
+	tempMetaDir, err := os.MkdirTemp("", "beanckup_meta_*")
 	if err != nil {
-		return fmt.Errorf("无法创建临时打包目录: %w", err)
+		return fmt.Errorf("无法创建本地临时元数据目录: %w", err)
 	}
-	defer os.RemoveAll(tempPackDir)
+	defer os.RemoveAll(tempMetaDir)
 
-	// 创建 .beanckup 子目录用于存放manifest
-	beanckupSubDir := filepath.Join(tempPackDir, ".beanckup")
+	// 2. 将动态生成的 manifest.json 写入这个本地临时目录
+	beanckupSubDir := filepath.Join(tempMetaDir, ".beanckup")
 	if err := os.MkdirAll(beanckupSubDir, 0755); err != nil {
-		return fmt.Errorf("无法创建临时 .beanckup 目录: %w", err)
+		return fmt.Errorf("无法创建本地临时 .beanckup 目录: %w", err)
 	}
-
-	// 将manifest保存到临时目录的 .beanckup 子目录中
 	manifestData, err := json.MarshalIndent(packageManifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("无法序列化随包清单: %w", err)
 	}
-
-	// 使用标准的manifest文件名格式
-	baseName := packageManifest.PackageName[:len(packageManifest.PackageName)-3] // 移除 .7z
-	manifestFilename := baseName + ".json"
-	manifestPath := filepath.Join(beanckupSubDir, manifestFilename)
+	manifestPath := filepath.Join(beanckupSubDir, strings.TrimSuffix(packageManifest.PackageName, ".7z")+".json")
 	if err := os.WriteFile(manifestPath, manifestData, 0644); err != nil {
-		return fmt.Errorf("无法写入临时清单文件: %w", err)
+		return fmt.Errorf("无法写入本地临时清单文件: %w", err)
 	}
 
-	// 复制所有新文件到临时目录，保持其相对路径结构
+	// 3. 创建本地“提货单”(listfile)，列出所有需要打包的文件的绝对路径
+	listFilePath := filepath.Join(tempMetaDir, "listfile.txt")
+	listFile, err := os.Create(listFilePath)
+	if err != nil {
+		return fmt.Errorf("无法创建本地提货单文件: %w", err)
+	}
 	for _, node := range newFiles {
-		sourcePath := filepath.Join(workspaceRoot, node.Path)
-		destPath := filepath.Join(tempPackDir, node.Path)
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-			return fmt.Errorf("无法在临时目录中创建子目录: %w", err)
-		}
-		if err := copyFile(sourcePath, destPath); err != nil {
-			return fmt.Errorf("无法复制文件 '%s' 到临时目录: %w", node.Path, err)
-		}
+		// 写入源文件的绝对路径，让7z直接去硬盘A取货
+		absPath := filepath.Join(workspaceRoot, node.Path)
+		listFile.WriteString(absPath + "\n")
 	}
+	listFile.Close() // 必须关闭才能让7z读取
 
-	// 构建7z命令参数，参考旧版的进度输出参数
+	// --- 4. 调用7z进行打包 ---
+	packageFilePath := filepath.Join(deliveryPath, packageManifest.PackageName)
+	
+	// a. 先根据“提货单”打包源文件到硬盘B
+	// 使用 -w 开关，让7z去掉源文件的盘符和根路径，只保留相对路径
 	args := []string{
-		"a",                                     // 添加文件
-		fmt.Sprintf("-mx=%d", compressionLevel), // 压缩级别
+		"a",
+		packageFilePath,
+		"@" + listFilePath, // 让7z读取提货单
+		fmt.Sprintf("-w%s", workspaceRoot), // **关键**: 设置工作目录为源盘的工作区，7z会自动处理为相对路径
+		fmt.Sprintf("-mx=%d", compressionLevel),
 		"-mmt=on",                               // 多线程
 		"-mhe=on",                               // 加密目录
 		"-bb3",                                  // 输出最大详细信息
 		"-bsp1",                                 // 输出标准进度信息
-		"-bso1",                                 // 将所有标准输出重定向到stdout
-		packageFilePath,                         // 输出文件
+		"-bso1", 
 	}
-
 	if password != "" {
 		args = append(args, "-p"+password)
 	}
-
-	// 切换到临时目录，然后打包所有内容
-	args = append(args, ".")
-
+	
 	cmd := exec.Command("7z", args...)
-	cmd.Dir = tempPackDir // 设置工作目录为临时目录
+	
+	// 执行打包并处理进度
+	if err := run7zAndHandleProgress(cmd, packageManifest.PackageName, progressCallback); err != nil {
+		return fmt.Errorf("打包源文件失败: %w", err)
+	}
 
+	// b. 使用 "u" (update) 命令，将本地临时目录中的 manifest.json 添加到硬盘B的压缩包中
+	updateArgs := []string{
+		"u",
+		packageFilePath,
+		filepath.Join(tempMetaDir, ".beanckup"), // 添加整个 .beanckup 文件夹
+		fmt.Sprintf("-w%s", tempMetaDir),      // **关键**: 设置工作目录为本地临时元数据目录
+	}
+	if password != "" {
+		updateArgs = append(updateArgs, "-p"+password)
+	}
+	updateCmd := exec.Command("7z", updateArgs...)
+	if err := updateCmd.Run(); err != nil {
+		return fmt.Errorf("添加清单到压缩包失败: %w", err)
+	}
+	
+	progressCallback(Progress{Percentage: 100, PackageName: packageManifest.PackageName, Stage: "完成"})
+	return nil
+}
+
+// run7zAndHandleProgress 是一个辅助函数，用于执行7z命令并实时处理进度输出
+func run7zAndHandleProgress(cmd *exec.Cmd, packageName string, progressCallback func(Progress)) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("无法获取 stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("无法获取 stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 7z 命令失败: %w", err)
 	}
+	
+	go func() { 
+		// 在后台静默处理stderr，避免阻塞
+		io.Copy(io.Discard, stderr) 
+	}()
 
-	// 实时解析7z输出
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		progress := parse7zProgress(line, packageManifest.PackageName)
-		progressCallback(progress)
+	reader := bufio.NewReader(stdout)
+	for {
+		line, err := reader.ReadString('\r')
+		if len(line) > 0 {
+			progress := parse7zProgress(line, packageName)
+			progressCallback(progress)
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("读取7z输出时出错: %v", err)
+			}
+			break
+		}
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("7z 命令执行失败: %w", err)
-	}
-
-	// 发送完成信号
-	progressCallback(Progress{Percentage: 100, PackageName: packageManifest.PackageName, Stage: "完成"})
-	return nil
+	return cmd.Wait()
 }
 
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
 
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	if err != nil {
-		return err
-	}
-
-	// 获取源文件的时间戳
-	sourceInfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-
-	// 设置目标文件的时间戳为源文件的时间戳
-	return os.Chtimes(dst, sourceInfo.ModTime(), sourceInfo.ModTime())
-}
-
-// parse7zProgress 解析7z的详细输出，参考旧版的方法
 func parse7zProgress(line, packageName string) Progress {
 	progress := Progress{
 		PackageName: packageName,
-		Stage:       "准备中",
+		Stage:       "压缩中",
 	}
-
-	// 移除ANSI颜色代码
-	line = removeANSICodes(line)
-
-	// 解析百分比进度
-	if percentage := extractPercentage(line); percentage >= 0 {
-		progress.Percentage = percentage
+	
+	parts := strings.Split(strings.TrimSpace(line), " ")
+	for _, part := range parts {
+		if strings.HasSuffix(part, "%") {
+			pStr := strings.TrimSuffix(part, "%")
+			if p, err := strconv.Atoi(pStr); err == nil {
+				progress.Percentage = p
+				break
+			}
+		}
 	}
-
-	// 解析当前处理的文件
-	if currentFile := extractCurrentFile(line); currentFile != "" {
-		progress.CurrentFile = currentFile
-	}
-
-	// 解析处理阶段
-	if stage := extractStage(line); stage != "" {
-		progress.Stage = stage
+	
+	re := regexp.MustCompile(`\s(?:U|A)\s(.+)`)
+	matches := re.FindStringSubmatch(line)
+	if len(matches) > 1 {
+		progress.CurrentFile = matches[1]
 	}
 
 	return progress
-}
-
-// removeANSICodes 移除ANSI转义序列
-func removeANSICodes(s string) string {
-	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-	return ansiRegex.ReplaceAllString(s, "")
-}
-
-// extractPercentage 提取百分比数值
-func extractPercentage(line string) int {
-	// 匹配各种百分比格式：45%, 45 %, 45% 等
-	percentageRegex := regexp.MustCompile(`(\d+)\s*%`)
-	matches := percentageRegex.FindStringSubmatch(line)
-	if len(matches) > 1 {
-		if p, err := strconv.Atoi(matches[1]); err == nil {
-			return p
-		}
-	}
-	return -1
-}
-
-// extractCurrentFile 提取当前处理的文件名
-func extractCurrentFile(line string) string {
-	// 7z输出中通常包含文件路径，查找常见的文件路径模式
-	// 简化处理，只显示文件名，不显示完整路径
-	fileRegex := regexp.MustCompile(`[^\\/]+\.\w+$|[^\\/]+$`)
-	matches := fileRegex.FindAllString(line, -1)
-	if len(matches) > 0 {
-		// 返回最后一个匹配的文件名
-		return matches[len(matches)-1]
-	}
-	return ""
-}
-
-// extractStage 提取处理阶段
-func extractStage(line string) string {
-	line = strings.ToLower(line)
-
-	if strings.Contains(line, "analyzing") || strings.Contains(line, "分析") {
-		return "分析文件"
-	} else if strings.Contains(line, "compressing") || strings.Contains(line, "压缩") {
-		return "压缩中"
-	} else if strings.Contains(line, "writing") || strings.Contains(line, "写入") {
-		return "写入文件"
-	} else if strings.Contains(line, "creating") || strings.Contains(line, "创建") {
-		return "创建包"
-	} else if strings.Contains(line, "updating") || strings.Contains(line, "更新") {
-		return "更新包"
-	}
-
-	return ""
 }
