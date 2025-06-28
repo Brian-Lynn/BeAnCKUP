@@ -51,6 +51,44 @@ func main() {
 	}
 }
 
+// 【新增函数】: 替换 util.DisplayDeliveryProgress 以提供更详细的信息
+func displayDeliveryProgress(plan *types.Plan, workspaceName string) {
+	fmt.Printf("\n=== 交付进度 (会话 S%d) ===\n", plan.SessionID)
+	fmt.Printf("计划交付总大小: %.2f MB\n", float64(plan.TotalNewSize)/1024/1024)
+
+	if len(plan.Episodes) > 0 {
+		fmt.Println("\n交付包详情:")
+		var deliveredSize int64
+		// 从plan中获取持久化的包大小限制
+		packageSizeLimitBytes := int64(plan.PackageSizeLimitMB) * 1024 * 1024
+
+		for i, episode := range plan.Episodes {
+			packageName := fmt.Sprintf("%s-S%02dE%02d", workspaceName, plan.SessionID, episode.ID)
+
+			// 检查是否会分卷，并生成提示信息
+			volumeNotice := ""
+			if plan.PackageSizeLimitMB > 0 && episode.TotalSize > packageSizeLimitBytes {
+				volumeNotice = " (超限，将分卷交付)"
+			}
+
+			fmt.Printf("  [%d] %s - %.2f MB (%d 个文件)%s - %s\n",
+				i+1,
+				packageName,
+				float64(episode.TotalSize)/1024/1024,
+				len(episode.Files),
+				volumeNotice,
+				episode.Status,
+			)
+
+			if episode.Status == types.EpisodeStatusCompleted {
+				deliveredSize += episode.TotalSize
+			}
+		}
+		fmt.Printf("\n当前已交付大小: %.2f MB\n", float64(deliveredSize)/1024/1024)
+	}
+}
+
+
 func selectWorkspace() string {
 	for {
 		fmt.Print("\n请输入或拖入工作区文件夹路径: ")
@@ -73,6 +111,11 @@ func handleScanAndDeliver() {
 		log.Printf("错误: 无法创建 .beanckup 目录: %v", err)
 		return
 	}
+	// 【核心修正】: 创建后立即将其设置为隐藏
+	if err := util.SetHidden(beanckupDir); err != nil {
+		log.Printf("警告: 无法将 .beanckup 文件夹设置为隐藏: %v", err)
+	}
+
 
 	fmt.Printf("\n已选择工作区: %s\n", workspacePath)
 
@@ -85,7 +128,20 @@ func handleScanAndDeliver() {
 	if plan != nil && !plan.IsCompleted() {
 		fmt.Printf("\n⚠️  发现未完成的交付任务 (会话 S%d, 还有 %d 个包未完成)\n",
 			plan.SessionID, plan.CountUnfinished())
-		util.DisplayDeliveryProgress(plan, workspaceName)
+
+		// 【断点续传清理】: 清理上次未完成任务可能残留的清单文件
+		for _, ep := range plan.Episodes {
+			if ep.Status == types.EpisodeStatusInProgress {
+				log.Printf("检测到上次交付中断，正在清理会话 S%dE%d 的残留状态...", plan.SessionID, ep.ID)
+				epPackageName := manifest.GeneratePackageName(workspaceName, plan.SessionID, ep.ID)
+				baseName := strings.TrimSuffix(epPackageName, ".7z")
+				manifestFilename := baseName + ".json"
+				manifestPath := filepath.Join(beanckupDir, manifestFilename)
+				os.Remove(manifestPath)
+			}
+		}
+
+		displayDeliveryProgress(plan, workspaceName) // 【核心修正】: 调用新的显示函数
 		fmt.Println("\n选项:")
 		fmt.Println("1. 继续未完成的交付")
 		fmt.Println("2. 忽略并开始新的扫描")
@@ -155,6 +211,7 @@ func handleScanAndDeliver() {
 
 	newSessionID := histState.MaxSessionID + 1
 	newPlan := session.CreatePlan(newSessionID, allNodes, params.PackageSizeLimitMB)
+	newPlan.PackageSizeLimitMB = params.PackageSizeLimitMB
 	session.ApplyTotalSizeLimitToPlan(newPlan, params.TotalSizeLimitMB)
 
 	if len(newPlan.Episodes) == 0 || newPlan.CountPending() == 0 {
@@ -168,7 +225,14 @@ func handleScanAndDeliver() {
 func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan *types.Plan, params *session.DeliveryParams) {
 	localReader := bufio.NewReader(os.Stdin)
 	currentPlan := plan
-	currentParams := params
+
+	currentParams := &session.DeliveryParams{
+		DeliveryPath:       params.DeliveryPath,
+		Password:           params.Password,
+		CompressionLevel:   params.CompressionLevel,
+		TotalSizeLimitMB:   params.TotalSizeLimitMB,
+		PackageSizeLimitMB: plan.PackageSizeLimitMB,
+	}
 
 	for {
 		runLimitBytes := int64(currentParams.TotalSizeLimitMB) * 1024 * 1024
@@ -186,7 +250,7 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 			}
 		}
 
-		util.DisplayDeliveryProgress(currentPlan, workspaceName)
+		displayDeliveryProgress(currentPlan, workspaceName) // 【核心修正】: 调用新的显示函数
 
 		if currentPlan.CountPending() == 0 {
 			if !currentPlan.IsCompleted() {
@@ -219,39 +283,79 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 			}
 			currentPlan.StatusFilePath = planFilePath
 
-			episodePackageName := manifest.GeneratePackageName(workspaceName, currentPlan.SessionID, episode.ID)
-			filesForPackageManifest := []*types.FileNode{}
+			// --- 【核心流程重构】 ---
 
+			// 1. 生成包名和清单对象
+			episodePackageName := manifest.GeneratePackageName(workspaceName, currentPlan.SessionID, episode.ID)
+
+			// 2. 创建一个包含所有数据文件的临时清单，用于生成 Reference
+			packageManifest := manifest.CreateManifest(workspaceName, currentPlan.SessionID, episode.ID, episodePackageName, episode.Files)
+
+			// 3. 确定引用名 (是否分卷)
+			packageSizeLimitBytes := int64(currentParams.PackageSizeLimitMB) * 1024 * 1024
+			willBeSplit := currentParams.PackageSizeLimitMB > 0 && episode.TotalSize > packageSizeLimitBytes
+
+			// 4. 为清单中的新文件设置正确的引用
+			var finalFilesForManifest []*types.FileNode
 			for _, fileNode := range episode.Files {
 				if fileNode.Reference == "" {
-					fileNode.Reference = fmt.Sprintf("%s/%s", episodePackageName, fileNode.Path)
+					refPackageName := episodePackageName
+					if willBeSplit {
+						refPackageName += ".001"
+					}
+					fileNode.Reference = fmt.Sprintf("%s/%s", refPackageName, fileNode.Path)
 				}
-				filesForPackageManifest = append(filesForPackageManifest, fileNode)
+				finalFilesForManifest = append(finalFilesForManifest, fileNode)
 			}
 			if episode.ID == 1 {
-				filesForPackageManifest = append(filesForPackageManifest, types.FilterReferenceFiles(currentPlan.AllNodes)...)
+				finalFilesForManifest = append(finalFilesForManifest, types.FilterReferenceFiles(currentPlan.AllNodes)...)
+			}
+			packageManifest.Files = finalFilesForManifest
+
+			// 5. 将最终的清单文件写入工作区的 .beanckup 目录
+			manifestFilePath, err := manifest.SaveManifest(packageManifest, beanckupDir)
+			if err != nil {
+				log.Printf("错误: 无法在工作区创建临时清单: %v", err)
+				episode.Status = types.EpisodeStatusPending
+				session.SavePlan(workspacePath, currentPlan)
+				continue
 			}
 
-			packageManifest := manifest.CreateManifest(workspaceName, currentPlan.SessionID, episode.ID, episodePackageName, filesForPackageManifest)
-			filesToPack := episode.Files
+			// 6. 准备待打包文件列表，将清单文件也作为一个节点加入
+			filesToPack := make([]*types.FileNode, len(episode.Files))
+			copy(filesToPack, episode.Files)
 
+			manifestRelPath, _ := filepath.Rel(workspacePath, manifestFilePath)
+			manifestInfo, _ := os.Stat(manifestFilePath)
+			manifestNode := &types.FileNode{
+				Path: filepath.ToSlash(manifestRelPath),
+				Size: manifestInfo.Size(),
+			}
+			filesToPack = append(filesToPack, manifestNode)
+
+			// 7. 调用简化的打包器
 			pkg := packager.NewPackager()
 			packageProgress := util.NewProgressDisplay()
+
 			err = pkg.CreatePackage(
 				currentParams.DeliveryPath,
-				packageManifest,
+				episodePackageName,
 				workspacePath,
 				filesToPack,
 				currentParams.Password,
 				currentParams.CompressionLevel,
+				currentParams.PackageSizeLimitMB,
 				func(p packager.Progress) {
-					packageProgress.UpdateProgress("  > 正在处理 [%d/%d]: %d%% - %s", i+1, len(currentPlan.Episodes), p.Percentage, p.CurrentFile)
+					packageProgress.UpdateProgress("  > 正在处理 [%d/%d]: %d%%", i+1, len(currentPlan.Episodes), p.Percentage)
 				},
 			)
 			packageProgress.Finish()
 
+			// 8. 【核心修正】: 只有在打包失败时才清理临时的清单文件。
+			// 成功后，清单文件必须保留在.beanckup目录作为历史记录。
 			if err != nil {
-				log.Printf("\n错误: 创建交付包 %s 失败: %v", packageManifest.PackageName, err)
+				log.Printf("\n错误: 创建交付包 %s 失败: %v", episodePackageName, err)
+				os.Remove(manifestFilePath) // 打包失败，清理掉这个无效的清单
 				episode.Status = types.EpisodeStatusPending
 				session.SavePlan(workspacePath, currentPlan)
 				if !askForConfirmation("交付失败，是否继续尝试下一个包?") {
@@ -260,17 +364,13 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 				continue
 			}
 
-			fmt.Printf("✓ 交付包 %s 已成功创建。\n", packageManifest.PackageName)
+			fmt.Printf("✓ 交付包 %s 已成功创建。\n", episodePackageName)
 			episode.Status = types.EpisodeStatusCompleted
-			if _, err := manifest.SaveManifest(packageManifest, beanckupDir); err != nil {
-				log.Printf("警告: 无法保存工作区清单: %v", err)
-			}
 			session.SavePlan(workspacePath, currentPlan)
 		}
 
 		if deliveryHappened {
-			fmt.Println("\n本轮交付完成。")
-			util.DisplayDeliveryProgress(currentPlan, workspaceName)
+			displayDeliveryProgress(currentPlan, workspaceName) // 【核心修正】: 调用新的显示函数
 		}
 
 		if currentPlan.IsCompleted() {
@@ -295,12 +395,15 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 			return
 		} else if choice == "2" {
 			fmt.Println("\n请重新设置交付参数以继续剩余任务:")
-			newParams := askForResumeDeliveryParams()
-			if newParams == nil {
+			resumeParams := askForResumeDeliveryParams()
+			if resumeParams == nil {
 				fmt.Println("取消继续交付。")
 				return
 			}
-			currentParams = newParams
+			currentParams.DeliveryPath = resumeParams.DeliveryPath
+			currentParams.Password = resumeParams.Password
+			currentParams.CompressionLevel = resumeParams.CompressionLevel
+			currentParams.TotalSizeLimitMB = resumeParams.TotalSizeLimitMB
 		} else {
 			fmt.Println("无效选择，程序将退出。")
 			return
@@ -391,11 +494,7 @@ func askForDeliveryParams(totalNewSizeBytes int64) *session.DeliveryParams {
 	if size, err := strconv.Atoi(strings.TrimSpace(input)); err == nil && size > 0 {
 		params.PackageSizeLimitMB = size
 	} else {
-		if params.TotalSizeLimitMB > 0 {
-			params.PackageSizeLimitMB = params.TotalSizeLimitMB
-		} else {
-			params.PackageSizeLimitMB = 0
-		}
+		params.PackageSizeLimitMB = 0 // 明确设置为0表示不分割
 	}
 
 	fmt.Print("请输入压缩级别 (0-9, 回车使用默认 0): ")
@@ -432,6 +531,9 @@ func askForResumeDeliveryParams() *session.DeliveryParams {
 		params.TotalSizeLimitMB = 0
 	}
 
+	// 移除了对 PackageSizeLimitMB 的提问，因为它已保存在 Plan 中
+	// 压缩级别和密码也应在恢复时重新确认
+
 	fmt.Print("请输入压缩级别 (0-9, 回车使用默认 0): ")
 	input, _ = localReader.ReadString('\n')
 	if level, err := strconv.Atoi(strings.TrimSpace(input)); err == nil && level >= 0 && level <= 9 {
@@ -448,7 +550,6 @@ func askForResumeDeliveryParams() *session.DeliveryParams {
 }
 
 func handleRestore() {
-	// 此部分未收到修改请求，保持原样
 	fmt.Println("\n=== 文件恢复 ===")
 	fmt.Print("请输入交付包存放路径 (回车使用默认): ")
 	deliveryPath, _ := reader.ReadString('\n')
@@ -472,8 +573,7 @@ func handleRestore() {
 	}
 	fmt.Printf("\n发现 %d 个备份记录:\n", len(sessions))
 	for i, session := range sessions {
-		// 修复：确保调用正确的函数名
-		res.LoadSessionManifests(session, "")
+		res.LoadSessionManifests(session, "") // 预加载以获取时间戳
 		fmt.Printf("  [%d] S%d - %s\n",
 			i+1,
 			session.SessionID,
@@ -492,7 +592,7 @@ func handleRestore() {
 	password, _ := reader.ReadString('\n')
 	password = strings.TrimSpace(password)
 	fmt.Printf("\n正在加载 S%d 的清单文件...\n", selectedSession.SessionID)
-	// 修复：确保调用正确的函数名
+
 	err = res.LoadSessionManifests(selectedSession, password)
 	if err != nil {
 		log.Printf("错误: 加载清单文件失败: %v\n", err)
@@ -516,7 +616,8 @@ func handleRestore() {
 		if len(selectedSession.Manifests) > 0 {
 			workspaceName = selectedSession.Manifests[0].WorkspaceName
 		}
-		ts := selectedSession.Timestamp.Format("2006-01-02 15:04:05")
+		// 【核心修正】: 更新时间戳格式为 YYMMDD_HHMMSS
+		ts := selectedSession.Timestamp.Format("060102_150405")
 		recoveryDir := fmt.Sprintf("%s_S%d_%s_Recovery", workspaceName, selectedSession.SessionID, ts)
 		finalRestorePath := filepath.Join(restorePath, recoveryDir)
 		fmt.Println("\n✓ 恢复成功！文件已存至:", finalRestorePath)

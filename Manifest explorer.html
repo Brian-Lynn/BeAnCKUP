@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BeAnCKUP清单浏览器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #f0f4f8;
+        }
+        #app {
+            display: flex;
+            height: 100vh;
+            max-height: 100vh; /* 确保应用不超过视口高度 */
+        }
+        #tree-view {
+            width: 300px; /* 初始宽度，会被 flex-basis 覆盖 */
+            flex-grow: 0;
+            flex-shrink: 0;
+            flex-basis: 25%; /* 初始宽度百分比 */
+            background-color: #ffffff;
+            border-right: 1px solid #e2e8f0;
+            overflow-y: auto;
+            padding: 1rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+        #splitter {
+            width: 8px; /* 分隔条宽度 */
+            background-color: #cbd5e0; /* 分隔条颜色 */
+            cursor: ew-resize; /* 鼠标样式 */
+            flex-shrink: 0; /* 防止分隔条收缩 */
+        }
+        #file-list {
+            flex-grow: 1;
+            flex-shrink: 1;
+            flex-basis: 75%; /* 初始宽度百分比 */
+            background-color: #ffffff;
+            overflow-y: auto;
+            padding: 1rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+        .tree-node {
+            cursor: pointer;
+            padding: 0.25rem 0;
+            display: flex;
+            align-items: center;
+            border-radius: 0.25rem; /* 保持圆角 */
+            padding-left: 0.5rem; /* 增加节点内边距 */
+            margin-bottom: 0.125rem; /* 节点之间略微间距 */
+        }
+        .tree-node:hover {
+            background-color: #f1f5f9;
+        }
+        .tree-node.selected {
+            background-color: #e0f2fe;
+            font-weight: bold;
+        }
+        .file-row {
+            display: flex;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid #edf2f7;
+            align-items: center;
+            cursor: pointer; /* 文件行也支持点击 */
+        }
+        .file-row:hover {
+            background-color: #f1f5f9;
+        }
+        .file-row:last-child {
+            border-bottom: none;
+        }
+        .file-header div {
+            cursor: pointer;
+            padding: 0.5rem;
+            font-weight: 600;
+            background-color: #f7fafc;
+            border-bottom: 2px solid #cbd5e0;
+            display: flex;
+            align-items: center;
+        }
+        .file-header div:hover {
+            background-color: #ebf4ff;
+        }
+        .file-header div i {
+            margin-left: 0.5rem;
+            font-size: 0.75rem;
+        }
+        .file-filter {
+            margin-left: 0.5rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            border: 1px solid #cbd5e0;
+            width: 80px; /* 调整筛选框宽度 */
+            font-size: 0.8rem;
+        }
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #3b82f6;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+            margin: 2rem auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        /* 树状图子目录缩进和线条 */
+        .child-container {
+            margin-left: 1.25rem; /* 更大缩进 */
+            border-left: 1px solid #cbd5e0; /* 左侧线条 */
+            padding-left: 0.5rem; /* 线条与内容间距 */
+        }
+        /* 确保树状图的图标和文本对齐 */
+        .tree-node .fas {
+            width: 1rem; /* 固定图标宽度 */
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="app" class="rounded-lg shadow-xl m-4">
+        <!-- Main header for app-level controls -->
+        <div class="absolute top-0 left-0 right-0 p-4 bg-white shadow-md flex justify-between items-center z-10 rounded-lg m-4">
+            <h1 class="text-2xl font-bold text-gray-800">BeAnCKUP清单浏览器</h1>
+            <div class="flex items-center space-x-4">
+                <input type="file" id="json-uploader" webkitdirectory multiple accept=".json" style="display:none;">
+                <button id="load-backup-btn" class="px-4 py-2 bg-green-500 text-white text-base rounded-md hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 transition duration-150 ease-in-out">
+                    <i class="fas fa-upload mr-2"></i>加载备份清册
+                </button>
+                <span id="current-workspace-info" class="text-gray-700 text-sm italic">当前工作区: 未加载</span>
+            </div>
+        </div>
+
+        <!-- Adjust app content to be below the new header -->
+        <div class="flex flex-grow mt-20"> <!-- Margin top to account for the new header -->
+            <!-- Left Tree View -->
+            <div id="tree-view" class="p-4 rounded-l-lg">
+                <h2 class="text-xl font-bold mb-4 text-gray-800">文件路径</h2>
+                <!-- Collapse/Expand All Buttons -->
+                <div class="mb-4 flex space-x-2">
+                    <button id="expand-all" class="px-3 py-1 bg-blue-500 text-white text-sm rounded-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition duration-150 ease-in-out">
+                        <i class="fas fa-expand-arrows-alt mr-1"></i>全部展开
+                    </button>
+                    <button id="collapse-all" class="px-3 py-1 bg-gray-500 text-white text-sm rounded-md hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-opacity-50 transition duration-150 ease-in-out">
+                        <i class="fas fa-compress-arrows-alt mr-1"></i>全部收缩
+                    </button>
+                </div>
+                <div id="tree-root">
+                    <!-- Tree view content will be generated here -->
+                    <p class="text-center text-gray-500 mt-8">请点击 "加载备份清册" 按钮开始。</p>
+                </div>
+            </div>
+
+            <!-- Resizable Splitter -->
+            <div id="splitter" class="w-2 bg-gray-300 cursor-ew-resize flex-shrink-0"></div>
+
+            <!-- Right File List View -->
+            <div id="file-list" class="flex-grow p-4 rounded-r-lg">
+                <h2 class="text-xl font-bold mb-4 text-gray-800">文件详情</h2>
+                <div id="file-list-header" class="file-header grid grid-cols-7 gap-2 text-sm text-gray-600 border-b-2 pb-2">
+                    <div data-sort="name" class="col-span-2">文件名 <i class="fas fa-sort"></i></div>
+                    <div data-sort="size">大小 <i class="fas fa-sort"></i></div>
+                    <div data-sort="create_time">创建时间 <i class="fas fa-sort"></i></div>
+                    <div data-sort="mod_time">修改时间 <i class="fas fa-sort"></i></div>
+                    <div data-sort="session_id">Session ID <i class="fas fa-sort"></i><input type="text" data-filter="session_id" placeholder="筛选" class="file-filter"></div>
+                    <div data-sort="episode_id">Episode ID <i class="fas fa-sort"></i><input type="text" data-filter="episode_id" placeholder="筛选" class="file-filter"></div>
+                </div>
+                <div id="file-list-body" class="text-sm text-gray-700">
+                    <!-- 文件列表内容将在这里生成 -->
+                    <p class="text-center text-gray-500 mt-8" id="initial-message">请从左侧选择一个目录以查看文件。</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        // Global variables to store all files
+        let allFiles = [];
+        // Store path tree structure and its collapsed state
+        let pathsTree = {};
+        // Currently selected directory
+        let currentDirectory = '';
+        // Current sort column and direction
+        let sortColumn = null;
+        let sortDirection = 'asc'; // 'asc' or 'desc'
+        // Filter conditions
+        let filters = {
+            session_id: '',
+            episode_id: ''
+        };
+        // Stores the primary workspace and session info
+        let currentWorkspaceName = '未加载';
+        let currentSessionId = 'N/A';
+
+        // Get DOM elements
+        const treeView = document.getElementById('tree-view');
+        const splitter = document.getElementById('splitter');
+        const fileList = document.getElementById('file-list');
+        const treeRoot = document.getElementById('tree-root');
+        const fileListBody = document.getElementById('file-list-body');
+        const fileListHeader = document.getElementById('file-list-header');
+        const initialMessage = document.getElementById('initial-message');
+
+        const loadBackupBtn = document.getElementById('load-backup-btn');
+        const jsonUploader = document.getElementById('json-uploader');
+        const currentWorkspaceInfo = document.getElementById('current-workspace-info');
+        const appContainer = document.getElementById('app'); // Get the main app container for width calculations
+
+        // Initialization function
+        async function initialize() {
+            treeRoot.innerHTML = '<p class="text-center text-gray-500 mt-8">请点击 "加载备份清册" 按钮开始。</p>';
+            fileListBody.innerHTML = '<p class="text-center text-gray-500 mt-8" id="initial-message">请从左侧选择一个目录以查看文件。</p>';
+            currentWorkspaceInfo.textContent = `当前工作区: ${currentWorkspaceName}, S${currentSessionId}`;
+            setupResizer(); // Setup the resizer on initialization
+        }
+
+        // Setup the resizer functionality
+        function setupResizer() {
+            let isDragging = false;
+
+            splitter.addEventListener('mousedown', (e) => {
+                isDragging = true;
+                document.body.style.cursor = 'ew-resize';
+                // Disable text selection during drag
+                document.body.style.userSelect = 'none';
+                document.body.style.webkitUserSelect = 'none';
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+
+                // Calculate total width of the content area (tree-view + splitter + file-list)
+                const appWidth = appContainer.offsetWidth; // Get the full width of the #app container
+
+                // Calculate new width for tree-view based on mouse position
+                const newTreeViewWidth = e.clientX - treeView.getBoundingClientRect().left;
+
+                // Ensure widths don't go below a minimum or exceed total width
+                const minWidth = 100; // Minimum width for each panel
+
+                if (newTreeViewWidth > minWidth && (appWidth - newTreeViewWidth - splitter.offsetWidth) > minWidth) {
+                    // Convert pixel width to percentage for flex-basis
+                    treeView.style.flexBasis = `${(newTreeViewWidth / appWidth) * 100}%`;
+                    fileList.style.flexBasis = `${((appWidth - newTreeViewWidth - splitter.offsetWidth) / appWidth) * 100}%`;
+                }
+            });
+
+            document.addEventListener('mouseup', () => {
+                isDragging = false;
+                document.body.style.cursor = 'default';
+                // Re-enable text selection
+                document.body.style.userSelect = '';
+                document.body.style.webkitUserSelect = '';
+            });
+
+            // Handle touch events for responsiveness
+            splitter.addEventListener('touchstart', (e) => {
+                isDragging = true;
+                e.preventDefault(); // Prevent scrolling
+                document.body.style.userSelect = 'none';
+                document.body.style.webkitUserSelect = 'none';
+            });
+
+            document.addEventListener('touchmove', (e) => {
+                if (!isDragging) return;
+                const touch = e.touches[0];
+                if (!touch) return; // No touch point
+
+                const appWidth = appContainer.offsetWidth;
+                const newTreeViewWidth = touch.clientX - treeView.getBoundingClientRect().left;
+                const minWidth = 100;
+
+                if (newTreeViewWidth > minWidth && (appWidth - newTreeViewWidth - splitter.offsetWidth) > minWidth) {
+                    treeView.style.flexBasis = `${(newTreeViewWidth / appWidth) * 100}%`;
+                    fileList.style.flexBasis = `${((appWidth - newTreeViewWidth - splitter.offsetWidth) / appWidth) * 100}%`;
+                }
+                e.preventDefault(); // Prevent scrolling while dragging
+            });
+
+            document.addEventListener('touchend', () => {
+                isDragging = false;
+                document.body.style.userSelect = '';
+                document.body.style.webkitUserSelect = '';
+            });
+        }
+
+
+        // Event listener for loading backup list
+        loadBackupBtn.addEventListener('click', () => {
+            jsonUploader.click(); // Trigger the hidden file input click
+        });
+
+        jsonUploader.addEventListener('change', async (event) => {
+            const files = event.target.files;
+            if (files.length === 0) {
+                return; // No files selected
+            }
+
+            allFiles = []; // Clear existing data
+            pathsTree = {}; // Clear existing tree structure
+            currentDirectory = ''; // Reset current directory
+
+            treeRoot.innerHTML = '<div class="spinner"></div>'; // Show loading spinner
+            fileListBody.innerHTML = '<div class="spinner"></div>'; // Show loading spinner
+            currentWorkspaceInfo.textContent = `当前工作区: 正在加载...`;
+
+            let totalJsonFiles = 0;
+            let firstJsonData = null; // To store the first workspace_name and session_id
+
+            const filePromises = [];
+
+            // Filter for JSON files and create promises for reading them
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                // Check if the file is a JSON file (by extension)
+                if (file.name.toLowerCase().endsWith('.json')) {
+                    totalJsonFiles++;
+                    filePromises.push(new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onload = (e) => {
+                            try {
+                                const jsonData = JSON.parse(e.target.result);
+                                // Store the first valid JSON's workspace_name and session_id
+                                if (firstJsonData === null) {
+                                    firstJsonData = jsonData;
+                                }
+                                resolve(jsonData);
+                            } catch (parseError) {
+                                console.error(`Error parsing JSON file ${file.name}:`, parseError);
+                                resolve(null); // Resolve with null for invalid JSON
+                            }
+                        };
+                        reader.onerror = (e) => {
+                            console.error(`Error reading file ${file.name}:`, e);
+                            resolve(null); // Resolve with null on read error
+                        };
+                        reader.readAsText(file);
+                    }));
+                }
+            }
+
+            if (totalJsonFiles === 0) {
+                treeRoot.innerHTML = '<p class="text-center text-gray-500 mt-8">未检测到JSON文件。</p>';
+                fileListBody.innerHTML = '<p class="text-center text-gray-500 mt-8">未检测到JSON文件。</p>';
+                currentWorkspaceInfo.textContent = `当前工作区: 未加载, S-`;
+                return;
+            }
+
+            const results = await Promise.all(filePromises);
+
+            results.forEach(jsonData => {
+                if (jsonData && jsonData.session_id !== undefined && jsonData.episode_id !== undefined && jsonData.files) {
+                    const sessionId = jsonData.session_id;
+                    const episodeId = jsonData.episode_id;
+                    jsonData.files.forEach(file => {
+                        allFiles.push({
+                            ...file,
+                            session_id: sessionId,
+                            episode_id: episodeId
+                        });
+                    });
+                }
+            });
+
+            if (allFiles.length > 0) {
+                buildPathsTree(); // Build the path tree structure
+                renderTreeView(); // Render the tree view
+                // Update workspace info with the first loaded JSON's details
+                if (firstJsonData) {
+                    currentWorkspaceName = firstJsonData.workspace_name || '未知工作区';
+                    currentSessionId = firstJsonData.session_id !== undefined ? String(firstJsonData.session_id).padStart(2, '0') : 'N/A';
+                    currentWorkspaceInfo.textContent = `当前工作区: ${currentWorkspaceName}, S${currentSessionId}`;
+                } else {
+                    currentWorkspaceInfo.textContent = `当前工作区: 未知, S-`;
+                }
+            } else {
+                treeRoot.innerHTML = '<p class="text-center text-gray-500 mt-8">未从JSON文件解析到任何文件数据。</p>';
+                fileListBody.innerHTML = '<p class="text-center text-gray-500 mt-8">未从JSON文件解析到任何文件数据。</p>';
+                currentWorkspaceInfo.textContent = `当前工作区: 未加载, S-`;
+            }
+        });
+
+
+        // Build the path tree structure, including collapse state
+        // Each node in pathsTree represents a directory.
+        // node._children contains sub-directories.
+        // node._files contains files directly within that directory.
+        function buildPathsTree() {
+            pathsTree = { _files: [], _children: {}, _isDir: true, _collapsed: false }; // Initialize root node
+
+            allFiles.forEach(file => {
+                const parts = file.path.split('/');
+                let currentDirNode = pathsTree; // Start from the root node
+
+                // If the file is directly in the root (e.g., "filename.txt"), parts.length will be 1
+                // The loop will not run for parts.length - 1 = 0
+                // So the file should be added to the _files of the currentDirNode (which is pathsTree)
+                // If parts.length > 1, then iterate through the path to find or create subdirectories
+                for (let i = 0; i < parts.length - 1; i++) {
+                    const part = parts[i];
+                    if (!currentDirNode._children[part]) {
+                        currentDirNode._children[part] = { _files: [], _children: {}, _isDir: true, _collapsed: false };
+                    }
+                    currentDirNode = currentDirNode._children[part];
+                }
+                // The last part is always the file name, the file goes into the _files array of the currentDirNode (which is its parent directory)
+                currentDirNode._files.push(file);
+            });
+        }
+
+        // Render the tree view
+        function renderTreeView() {
+            treeRoot.querySelector('.spinner')?.remove(); // Remove loading indicator if present
+            // Only clear the dynamic content within treeRoot, not the buttons div
+            const buttonsDiv = treeRoot.querySelector('.mb-4.flex.space-x-2');
+            if (buttonsDiv) {
+                // Clear everything but the buttons div
+                Array.from(treeRoot.children).forEach(child => {
+                    if (child !== buttonsDiv && child.tagName !== 'H2') { // Also preserve the H2 title
+                        child.remove();
+                    }
+                });
+            } else {
+                 treeRoot.innerHTML = ''; // If buttons not found (initial render), clear all
+            }
+
+
+            // Recursively render tree view nodes (directories only)
+            // parentDirNode: The actual directory object whose children we are rendering (e.g., pathsTree or a subdirectory node)
+            // parentFullPath: The full path of parentDirNode.
+            // parentElement: The DOM element where directory nodes should be appended.
+            function renderDirectoryNode(parentDirNode, parentFullPath, parentElement) {
+                // Render subdirectories (children of parentDirNode)
+                // Sort directory names alphabetically
+                const sortedDirNames = Object.keys(parentDirNode._children).sort((a, b) => a.localeCompare(b));
+
+                sortedDirNames.forEach(dirName => {
+                    const node = parentDirNode._children[dirName]; // This is the directory object itself
+                    const path = parentFullPath ? `${parentFullPath}/${dirName}` : dirName; // Build full path
+
+                    const nodeElement = document.createElement('div');
+                    nodeElement.className = `tree-node rounded-md ${path === currentDirectory ? 'selected' : ''} py-1`;
+                    nodeElement.dataset.path = path;
+
+                    // Directory collapse/expand icon
+                    const caretIcon = document.createElement('i');
+                    caretIcon.className = `fas mr-1 cursor-pointer w-3 text-center ${node._collapsed ? 'fa-caret-right' : 'fa-caret-down'}`;
+                    caretIcon.addEventListener('click', (event) => {
+                        event.stopPropagation(); // Stop event bubbling to parent node
+                        node._collapsed = !node._collapsed; // Toggle collapsed state
+                        // Directly update icon and child container visibility, avoid full re-render
+                        caretIcon.classList.toggle('fa-caret-right', node._collapsed);
+                        caretIcon.classList.toggle('fa-caret-down', !node._collapsed);
+                        const childContainer = nodeElement.nextElementSibling;
+                        if (childContainer && childContainer.classList.contains('child-container')) {
+                            childContainer.classList.toggle('hidden', node._collapsed);
+                        }
+                    });
+                    nodeElement.appendChild(caretIcon);
+
+                    // Folder icon
+                    const icon = document.createElement('i');
+                    icon.className = 'fas fa-folder text-yellow-500 mr-2';
+                    nodeElement.appendChild(icon);
+
+                    const span = document.createElement('span');
+                    span.textContent = dirName;
+                    nodeElement.appendChild(span);
+
+                    nodeElement.addEventListener('click', (event) => {
+                        event.stopPropagation();
+                        selectDirectory(path);
+                    });
+
+                    parentElement.appendChild(nodeElement);
+
+                    // Recursively render children directories
+                    const childContainer = document.createElement('div');
+                    childContainer.className = `child-container ${node._collapsed ? 'hidden' : ''}`;
+                    renderDirectoryNode(node, path, childContainer); // Pass the current directory node
+                    parentElement.appendChild(childContainer);
+                });
+            }
+
+            // Initial call: Start rendering from the children of the root `pathsTree` node.
+            renderDirectoryNode(pathsTree, '', treeRoot);
+
+            // Bind collapse/expand all buttons' event listeners - Only if they exist
+            const expandAllBtn = document.getElementById('expand-all');
+            const collapseAllBtn = document.getElementById('collapse-all');
+
+            if (expandAllBtn && collapseAllBtn) {
+                expandAllBtn.onclick = () => toggleAllDirectories(false);
+                collapseAllBtn.onclick = () => toggleAllDirectories(true);
+            }
+        }
+
+        // Toggle collapsed state of all directories
+        function toggleAllDirectories(collapse) {
+            function traverseAndToggle(node) {
+                // Ensure it's a directory node and has _children
+                if (node._isDir && node._children) {
+                    node._collapsed = collapse; // Set collapse state for current directory
+                    // Recursively traverse children directories
+                    for (const dirName in node._children) {
+                        traverseAndToggle(node._children[dirName]);
+                    }
+                }
+            }
+            traverseAndToggle(pathsTree); // Start traversal from the root pathsTree
+            renderTreeView(); // Re-render tree view to reflect changes
+        }
+
+        // Select directory and display file list
+        function selectDirectory(path) {
+            currentDirectory = path;
+            // Remove selected state from all tree nodes
+            document.querySelectorAll('.tree-node').forEach(node => {
+                node.classList.remove('selected');
+            });
+            // Add selected state to current tree node
+            const selectedNode = document.querySelector(`.tree-node[data-path="${path}"]`);
+            if (selectedNode) {
+                selectedNode.classList.add('selected');
+            }
+            renderFileList();
+        }
+
+        // Render file list (now shows both subdirectories and files)
+        function renderFileList() {
+            fileListBody.innerHTML = ''; // Clear file list
+            initialMessage.classList.add('hidden'); // Hide initial message
+
+            const selectedDirNode = findDirectoryNode(currentDirectory);
+            let displayItems = []; // Will hold both directories and files
+
+            if (selectedDirNode) {
+                // Add subdirectories
+                // Sort directory names alphabetically before adding to displayItems
+                const sortedDirNames = Object.keys(selectedDirNode._children).sort((a, b) => a.localeCompare(b));
+                sortedDirNames.forEach(dirName => {
+                    const dirPath = currentDirectory ? `${currentDirectory}/${dirName}` : dirName;
+                    displayItems.push({
+                        name: dirName,
+                        path: dirPath,
+                        isDirectory: true,
+                        // Directories don't have direct size, time, session/episode IDs in this context
+                        size: '---',
+                        create_time: '---',
+                        mod_time: '---',
+                        session_id: '---',
+                        episode_id: '---'
+                    });
+                });
+
+                // Add files
+                // Sort files by name alphabetically before adding to displayItems
+                const sortedFiles = [...selectedDirNode._files].sort((a, b) => {
+                    const nameA = a.path.split('/').pop();
+                    const nameB = b.path.split('/').pop();
+                    return nameA.localeCompare(nameB);
+                });
+                sortedFiles.forEach(file => {
+                    displayItems.push({
+                        ...file,
+                        name: file.path.split('/').pop(), // Extract just the file name
+                        isDirectory: false
+                    });
+                });
+            }
+
+            // Apply filter conditions
+            // Filters for session_id and episode_id will effectively only apply to actual files
+            displayItems = displayItems.filter(item => {
+                const sessionIdMatch = filters.session_id === '' || String(item.session_id).includes(filters.session_id);
+                const episodeIdMatch = filters.episode_id === '' || String(item.episode_id).includes(filters.episode_id);
+                return sessionIdMatch && episodeIdMatch;
+            });
+
+            // Apply sorting
+            if (sortColumn) {
+                displayItems.sort((a, b) => {
+                    // Directories always come before files if sorting by name or type
+                    if (a.isDirectory && !b.isDirectory) return -1;
+                    if (!a.isDirectory && b.isDirectory) return 1;
+
+                    // If both are directories or both are files, then sort by selected column
+                    let valA = a[sortColumn];
+                    let valB = b[sortColumn];
+
+                    if (sortColumn === 'size') {
+                        valA = a.isDirectory ? -Infinity : parseInt(valA); // Directories are "smaller" for sorting
+                        valB = b.isDirectory ? -Infinity : parseInt(valB);
+                    } else if (sortColumn === 'create_time' || sortColumn === 'mod_time') {
+                        valA = a.isDirectory ? new Date(0).getTime() : new Date(valA).getTime(); // Directories effectively have earliest time
+                        valB = b.isDirectory ? new Date(0).getTime() : new Date(valB).getTime();
+                    } else if (sortColumn === 'session_id' || sortColumn === 'episode_id') {
+                        valA = a.isDirectory ? -Infinity : parseInt(valA);
+                        valB = b.isDirectory ? -Infinity : parseInt(valB);
+                    } else if (sortColumn === 'name') {
+                        valA = a.name;
+                        valB = b.name;
+                    }
+
+                    if (typeof valA === 'string' && typeof valB === 'string') {
+                        return sortDirection === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+                    } else {
+                        if (valA < valB) return sortDirection === 'asc' ? -1 : 1;
+                        if (valA > valB) return sortDirection === 'asc' ? 1 : -1;
+                        return 0;
+                    }
+                });
+            }
+
+            if (displayItems.length === 0) {
+                fileListBody.innerHTML = '<p class="text-center text-gray-500 mt-8">此目录下没有文件或子目录。</p>';
+                return;
+            }
+
+            displayItems.forEach(item => {
+                const iconHtml = item.isDirectory ? '<i class="fas fa-folder text-yellow-500 mr-2"></i>' : '<i class="fas fa-file text-blue-500 mr-2"></i>';
+                const sizeDisplay = item.isDirectory ? '---' : `${(item.size / 1024).toFixed(2)} KB`;
+                const createTimeDisplay = item.isDirectory ? '---' : new Date(item.create_time).toLocaleString();
+                const modTimeDisplay = item.isDirectory ? '---' : new Date(item.mod_time).toLocaleString();
+                const sessionIdDisplay = item.isDirectory ? '---' : `S${String(item.session_id).padStart(2, '0')}`;
+                const episodeIdDisplay = item.isDirectory ? '---' : `E${String(item.episode_id).padStart(2, '0')}`;
+
+                const row = document.createElement('div');
+                row.className = 'file-row grid grid-cols-7 gap-2';
+                row.innerHTML = `
+                    <div class="col-span-2 truncate">${iconHtml}${item.name}</div>
+                    <div class="truncate">${sizeDisplay}</div>
+                    <div class="truncate">${createTimeDisplay}</div>
+                    <div class="truncate">${modTimeDisplay}</div>
+                    <div class="truncate">${sessionIdDisplay}</div>
+                    <div class="truncate">${episodeIdDisplay}</div>
+                `;
+
+                if (item.isDirectory) {
+                    row.addEventListener('click', () => {
+                        selectDirectory(item.path); // Navigate into the subdirectory
+                    });
+                }
+                // Files are not clickable as there's no associated action now.
+                // If future features require file selection, re-add the 'selected-file' class logic.
+
+                fileListBody.appendChild(row);
+            });
+        }
+
+        // Function to find the directory node for a given path
+        function findDirectoryNode(path) {
+            if (path === '') return pathsTree; // Root directory
+
+            const parts = path.split('/');
+            let currentNode = pathsTree;
+            for (const part of parts) {
+                if (!currentNode._children[part]) {
+                    return null; // Path not found
+                }
+                currentNode = currentNode._children[part];
+            }
+            return currentNode;
+        }
+
+
+        // Handle sort header click event
+        fileListHeader.addEventListener('click', (event) => {
+            const target = event.target.closest('[data-sort]');
+            // Ensure filter input box is not clicked
+            if (target && !event.target.classList.contains('file-filter')) {
+                const column = target.dataset.sort;
+                if (sortColumn === column) {
+                    sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortColumn = column;
+                    sortDirection = 'asc';
+                }
+                // Update sort icon
+                fileListHeader.querySelectorAll('i').forEach(icon => {
+                    icon.className = 'fas fa-sort'; // Reset all icons
+                });
+                const currentIcon = target.querySelector('i');
+                if (currentIcon) {
+                    currentIcon.className = sortDirection === 'asc' ? 'fas fa-sort-up' : 'fas fa-sort-down';
+                }
+                renderFileList();
+            }
+        });
+
+        // Handle filter input event
+        fileListHeader.addEventListener('input', (event) => {
+            const target = event.target;
+            if (target.dataset.filter) {
+                filters[target.dataset.filter] = target.value;
+                renderFileList();
+            }
+        });
+
+        // Page load initialization
+        window.onload = initialize;
+    </script>
+</body>
+</html>

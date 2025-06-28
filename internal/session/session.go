@@ -21,7 +21,6 @@ type DeliveryParams struct {
 }
 
 // CreatePlan 根据扫描结果创建交付计划
-// 这个函数现在只负责将“新文件”进行打包计划
 func CreatePlan(sessionID int, allNodes []*types.FileNode, packageSizeLimitMB int) *types.Plan {
 	plan := &types.Plan{
 		SessionID: sessionID,
@@ -42,45 +41,56 @@ func CreatePlan(sessionID int, allNodes []*types.FileNode, packageSizeLimitMB in
 		return plan
 	}
 
+	// 按文件路径进行排序，而不是文件大小
 	sort.Slice(newFiles, func(i, j int) bool {
-		return newFiles[i].Size > newFiles[j].Size
+		return newFiles[i].Path < newFiles[j].Path
 	})
 
 	var episodes []types.Episode
 	packageSizeLimitBytes := int64(packageSizeLimitMB) * 1024 * 1024
 
-	if packageSizeLimitMB > 0 {
-		var currentEpisode types.Episode
-		currentEpisode.Files = []*types.FileNode{}
-		for _, file := range newFiles {
-			if file.Size > packageSizeLimitBytes {
-				if len(currentEpisode.Files) > 0 {
-					episodes = append(episodes, currentEpisode)
-				}
-				episodes = append(episodes, types.Episode{
-					Files:     []*types.FileNode{file},
-					TotalSize: file.Size,
-				})
-				currentEpisode = types.Episode{Files: []*types.FileNode{}, TotalSize: 0}
-			} else if currentEpisode.TotalSize+file.Size > packageSizeLimitBytes {
-				episodes = append(episodes, currentEpisode)
-				currentEpisode = types.Episode{
-					Files:     []*types.FileNode{file},
-					TotalSize: file.Size,
-				}
-			} else {
-				currentEpisode.Files = append(currentEpisode.Files, file)
-				currentEpisode.TotalSize += file.Size
-			}
-		}
-		if len(currentEpisode.Files) > 0 {
-			episodes = append(episodes, currentEpisode)
-		}
-	} else {
+	// 如果不分包，所有文件放入一个 episode
+	if packageSizeLimitMB <= 0 {
 		episodes = append(episodes, types.Episode{
 			Files:     newFiles,
 			TotalSize: totalNewSize,
 		})
+	} else {
+		// 实现基于路径的顺序填充逻辑
+		if len(newFiles) > 0 {
+			currentEpisode := types.Episode{Files: []*types.FileNode{}, TotalSize: 0}
+			for _, file := range newFiles {
+				// 如果是超大文件，则它自己单独成为一个 episode
+				if file.Size > packageSizeLimitBytes {
+					if len(currentEpisode.Files) > 0 {
+						episodes = append(episodes, currentEpisode)
+					}
+					episodes = append(episodes, types.Episode{
+						Files:     []*types.FileNode{file},
+						TotalSize: file.Size,
+					})
+					currentEpisode = types.Episode{Files: []*types.FileNode{}, TotalSize: 0}
+					continue
+				}
+
+				// 如果当前 episode 加上新文件会超限
+				if currentEpisode.TotalSize+file.Size > packageSizeLimitBytes {
+					episodes = append(episodes, currentEpisode)
+					currentEpisode = types.Episode{
+						Files:     []*types.FileNode{file},
+						TotalSize: file.Size,
+					}
+				} else {
+					// 否则，将文件加入当前 episode
+					currentEpisode.Files = append(currentEpisode.Files, file)
+					currentEpisode.TotalSize += file.Size
+				}
+			}
+			// 不要忘记循环结束后最后一个正在构建的 episode
+			if len(currentEpisode.Files) > 0 {
+				episodes = append(episodes, currentEpisode)
+			}
+		}
 	}
 
 	for i := range episodes {
@@ -138,7 +148,8 @@ func SavePlan(workspacePath string, plan *types.Plan) (string, error) {
 	}
 
 	workspaceName := filepath.Base(workspacePath)
-	timestamp := plan.Timestamp.Format("20060102150405")
+	// 【核心修正】: 更新时间戳格式为 YYMMDD_HHMMSS
+	timestamp := plan.Timestamp.Format("060102_150405")
 	planFileName := fmt.Sprintf("Delivery_Status_%s_S%02d_%s.json", workspaceName, plan.SessionID, timestamp)
 	planPath := filepath.Join(beanckupDir, planFileName)
 
@@ -237,9 +248,17 @@ func CleanupIncompletePackages(deliveryPath string, plan *types.Plan, workspaceN
 		if episode.Status != types.EpisodeStatusCompleted {
 			packageName := fmt.Sprintf("%s-S%02dE%02d.7z", workspaceName, plan.SessionID, episode.ID)
 			packagePath := filepath.Join(deliveryPath, packageName)
+
 			if _, err := os.Stat(packagePath); err == nil {
 				fmt.Printf("清理不完整的交付包: %s\n", packageName)
 				os.Remove(packagePath)
+			}
+			
+			globPattern := packagePath + ".*"
+			if files, _ := filepath.Glob(globPattern); files != nil {
+				for _, f := range files {
+					os.Remove(f)
+				}
 			}
 		}
 	}

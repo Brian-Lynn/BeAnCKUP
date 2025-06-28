@@ -3,7 +3,6 @@ package packager
 import (
 	"beanckup-cli/internal/types"
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +14,7 @@ import (
 	"strings"
 )
 
+// Progress 结构体定义了打包过程中的进度信息
 type Progress struct {
 	Percentage  int
 	PackageName string
@@ -22,111 +22,96 @@ type Progress struct {
 	Stage       string
 }
 
+// Packager 结构体封装了打包相关的功能
 type Packager struct{}
 
+// NewPackager 创建一个新的 Packager 实例
 func NewPackager() *Packager {
 	return &Packager{}
 }
 
-// CreatePackage 使用“直接提货单”模式创建7z包，不再需要临时“集散地”
+// CreatePackage 使用最简单、最可靠的“一次性打包”模型。
+// 它接收一个包含所有数据文件和清单文件的列表，然后执行一次 `7z a` 命令。
 func (p *Packager) CreatePackage(
 	deliveryPath string,
-	packageManifest *types.Manifest,
+	packageName string, // 只需要包名用于显示
 	workspaceRoot string,
-	newFiles []*types.FileNode,
+	filesToPack []*types.FileNode, // 包含数据文件和清单文件
 	password string,
 	compressionLevel int,
+	packageSizeLimitMB int,
 	progressCallback func(Progress),
 ) error {
-	// 确保最终输出目录存在，但我们不会在这里创建任何集散地。
-	if err := os.MkdirAll(deliveryPath, 0755); err != nil {
-		return fmt.Errorf("无法创建交付目录: %w", err)
-	}
-
-	// 1. 在操作系a统的默认临时目录 (通常是本地SSD) 创建一个极小的元数据文件夹。
-	//    这完全符合您的要求：临时文件在本地，不写入输出盘。
-	tempMetaDir, err := os.MkdirTemp("", "beanckup_meta_*")
+	// 1. 在系统临时目录创建 listfile.txt
+	tempListDir, err := os.MkdirTemp("", "beanckup_list_*")
 	if err != nil {
-		return fmt.Errorf("无法创建本地临时元数据目录: %w", err)
+		return fmt.Errorf("无法创建临时列表目录: %w", err)
 	}
-	defer os.RemoveAll(tempMetaDir)
+	defer os.RemoveAll(tempListDir)
 
-	// 2. 将动态生成的 manifest.json 写入这个本地临时目录
-	beanckupSubDir := filepath.Join(tempMetaDir, ".beanckup")
-	if err := os.MkdirAll(beanckupSubDir, 0755); err != nil {
-		return fmt.Errorf("无法创建本地临时 .beanckup 目录: %w", err)
-	}
-	manifestData, err := json.MarshalIndent(packageManifest, "", "  ")
-	if err != nil {
-		return fmt.Errorf("无法序列化随包清单: %w", err)
-	}
-	manifestPath := filepath.Join(beanckupSubDir, strings.TrimSuffix(packageManifest.PackageName, ".7z")+".json")
-	if err := os.WriteFile(manifestPath, manifestData, 0644); err != nil {
-		return fmt.Errorf("无法写入本地临时清单文件: %w", err)
-	}
-
-	// 3. 创建本地“提货单”(listfile)，列出所有需要打包的文件的绝对路径
-	listFilePath := filepath.Join(tempMetaDir, "listfile.txt")
+	listFilePath := filepath.Join(tempListDir, "listfile.txt")
 	listFile, err := os.Create(listFilePath)
 	if err != nil {
-		return fmt.Errorf("无法创建本地提货单文件: %w", err)
+		return fmt.Errorf("无法创建文件列表: %w", err)
 	}
-	for _, node := range newFiles {
-		// 写入源文件的绝对路径，让7z直接去硬盘A取货
-		absPath := filepath.Join(workspaceRoot, node.Path)
-		listFile.WriteString(absPath + "\n")
+	for _, node := range filesToPack {
+		// 写入所有文件的相对路径
+		listFile.WriteString(node.Path + "\n")
 	}
-	listFile.Close() // 必须关闭才能让7z读取
+	listFile.Close()
 
-	// --- 4. 调用7z进行打包 ---
-	packageFilePath := filepath.Join(deliveryPath, packageManifest.PackageName)
-	
-	// a. 先根据“提货单”打包源文件到硬盘B
-	// 使用 -w 开关，让7z去掉源文件的盘符和根路径，只保留相对路径
+	// 2. 准备7z命令参数
+	packageFilePath := filepath.Join(deliveryPath, packageName)
 	args := []string{
 		"a",
-		packageFilePath,
-		"@" + listFilePath, // 让7z读取提货单
-		fmt.Sprintf("-w%s", workspaceRoot), // **关键**: 设置工作目录为源盘的工作区，7z会自动处理为相对路径
+		packageFilePath,    // 最终输出的压缩包基础名
+		"@" + listFilePath, // 让7z根据列表读取文件
+		"-w" + deliveryPath, // 强制临时文件在交付目录生成
 		fmt.Sprintf("-mx=%d", compressionLevel),
-		"-mmt=on",                               // 多线程
-		"-mhe=on",                               // 加密目录
-		"-bb3",                                  // 输出最大详细信息
-		"-bsp1",                                 // 输出标准进度信息
-		"-bso1", 
-	}
-	if password != "" {
-		args = append(args, "-p"+password)
-	}
-	
-	cmd := exec.Command("7z", args...)
-	
-	// 执行打包并处理进度
-	if err := run7zAndHandleProgress(cmd, packageManifest.PackageName, progressCallback); err != nil {
-		return fmt.Errorf("打包源文件失败: %w", err)
+		"-mmt=on",
+		"-bb3",
+		"-bsp1",
+		"-bso1",
 	}
 
-	// b. 使用 "u" (update) 命令，将本地临时目录中的 manifest.json 添加到硬盘B的压缩包中
-	updateArgs := []string{
-		"u",
-		packageFilePath,
-		filepath.Join(tempMetaDir, ".beanckup"), // 添加整个 .beanckup 文件夹
-		fmt.Sprintf("-w%s", tempMetaDir),      // **关键**: 设置工作目录为本地临时元数据目录
+	// 3. 判断是否需要分卷
+	var episodeTotalSize int64
+	for _, node := range filesToPack {
+		// 注意：清单文件本身很小，其大小对是否分卷的判断影响可忽略
+		episodeTotalSize += node.Size
 	}
+	packageSizeLimitBytes := int64(packageSizeLimitMB) * 1024 * 1024
+	if packageSizeLimitMB > 0 && episodeTotalSize > packageSizeLimitBytes {
+		args = append(args, fmt.Sprintf("-v%dm", packageSizeLimitMB))
+	}
+
 	if password != "" {
-		updateArgs = append(updateArgs, "-p"+password)
+		args = append(args, "-p"+password, "-mhe=on")
 	}
-	updateCmd := exec.Command("7z", updateArgs...)
-	if err := updateCmd.Run(); err != nil {
-		return fmt.Errorf("添加清单到压缩包失败: %w", err)
+
+	// 4. 执行一次性的 `7z a` 命令
+	cmd := exec.Command("7z", args...)
+	cmd.Dir = workspaceRoot // 将工作目录设置为源工作区，以便7z能通过相对路径找到所有文件
+
+	if err := run7zAndHandleProgress(cmd, packageName, "打包文件和清单", progressCallback); err != nil {
+		// 如果打包失败，尝试删除可能产生的未完成的包
+		os.Remove(packageFilePath)
+		// 同时尝试清理可能产生的分卷文件
+		globPattern := packageFilePath + ".0*"
+		if files, _ := filepath.Glob(globPattern); files != nil {
+			for _, f := range files {
+				os.Remove(f)
+			}
+		}
+		return fmt.Errorf("创建压缩包失败: %w", err)
 	}
-	
-	progressCallback(Progress{Percentage: 100, PackageName: packageManifest.PackageName, Stage: "完成"})
+
+	progressCallback(Progress{Percentage: 100, PackageName: packageName, Stage: "完成"})
 	return nil
 }
 
-// run7zAndHandleProgress 是一个辅助函数，用于执行7z命令并实时处理进度输出
-func run7zAndHandleProgress(cmd *exec.Cmd, packageName string, progressCallback func(Progress)) error {
+// run7zAndHandleProgress 保持不变，它能很好地处理进度
+func run7zAndHandleProgress(cmd *exec.Cmd, packageName, stage string, progressCallback func(Progress)) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("无法获取 stdout pipe: %w", err)
@@ -139,18 +124,17 @@ func run7zAndHandleProgress(cmd *exec.Cmd, packageName string, progressCallback 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 7z 命令失败: %w", err)
 	}
-	
-	go func() { 
-		// 在后台静默处理stderr，避免阻塞
-		io.Copy(io.Discard, stderr) 
-	}()
+
+	go io.Copy(io.Discard, stderr)
 
 	reader := bufio.NewReader(stdout)
 	for {
 		line, err := reader.ReadString('\r')
 		if len(line) > 0 {
-			progress := parse7zProgress(line, packageName)
-			progressCallback(progress)
+			progress := parse7zProgress(line, packageName, stage)
+			if progress.Percentage > 0 || strings.Contains(line, "%") {
+				progressCallback(progress)
+			}
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -163,28 +147,25 @@ func run7zAndHandleProgress(cmd *exec.Cmd, packageName string, progressCallback 
 	return cmd.Wait()
 }
 
-
-func parse7zProgress(line, packageName string) Progress {
+// parse7zProgress 保持不变
+func parse7zProgress(line, packageName, stage string) Progress {
 	progress := Progress{
 		PackageName: packageName,
-		Stage:       "压缩中",
+		Stage:       stage,
 	}
-	
-	parts := strings.Split(strings.TrimSpace(line), " ")
-	for _, part := range parts {
-		if strings.HasSuffix(part, "%") {
-			pStr := strings.TrimSuffix(part, "%")
-			if p, err := strconv.Atoi(pStr); err == nil {
-				progress.Percentage = p
-				break
-			}
+
+	rePercent := regexp.MustCompile(`(\d+)\%`)
+	matchesPercent := rePercent.FindStringSubmatch(line)
+	if len(matchesPercent) > 1 {
+		if p, err := strconv.Atoi(matchesPercent[1]); err == nil {
+			progress.Percentage = p
 		}
 	}
-	
-	re := regexp.MustCompile(`\s(?:U|A)\s(.+)`)
-	matches := re.FindStringSubmatch(line)
-	if len(matches) > 1 {
-		progress.CurrentFile = matches[1]
+
+	reFile := regexp.MustCompile(`\s(U|A|Compressing)\s+(.+)`)
+	matchesFile := reFile.FindStringSubmatch(line)
+	if len(matchesFile) > 2 {
+		progress.CurrentFile = strings.TrimSpace(matchesFile[2])
 	}
 
 	return progress

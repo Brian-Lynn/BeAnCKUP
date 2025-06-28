@@ -65,7 +65,6 @@ func FilterReferenceFiles(nodes []*FileNode) []*FileNode {
 
 // HistoricalState 持有从所有过去的 manifest 文件中加载的信息
 type HistoricalState struct {
-	// 修复：移除错误的 `types.` 前缀
 	HashToNode   map[string]*FileNode
 	PathToNode   map[string]*FileNode
 	MaxSessionID int
@@ -84,22 +83,22 @@ const (
 
 // Episode 代表一个具体的交付包计划
 type Episode struct {
-	ID        int           `json:"id"`
-	TotalSize int64         `json:"total_size"`
-	// 修复：移除错误的 `types.` 前缀
-	Files     []*FileNode   `json:"files"`
+	ID        int         `json:"id"`
+	TotalSize int64       `json:"total_size"`
+	Files     []*FileNode `json:"files"`
 	Status    EpisodeStatus `json:"status"`
 }
 
 // Plan 代表一次完整的交付会话计划
 type Plan struct {
-	SessionID      int         `json:"session_id"`
-	Timestamp      time.Time   `json:"timestamp"`
-	TotalNewSize   int64       `json:"total_new_size"`
-	Episodes       []Episode   `json:"episodes"`
-	// 修复：移除错误的 `types.` 前缀
-	AllNodes       []*FileNode `json:"-"`
-	StatusFilePath string      `json:"-"`
+	SessionID          int       `json:"session_id"`
+	Timestamp          time.Time `json:"timestamp"`
+	TotalNewSize       int64     `json:"total_new_size"`
+	// 【核心修正】: 将包大小限制持久化到Plan中
+	PackageSizeLimitMB int       `json:"package_size_limit_mb"`
+	Episodes           []Episode `json:"episodes"`
+	AllNodes           []*FileNode `json:"-"`
+	StatusFilePath     string    `json:"-"`
 }
 
 // IsCompleted 检查整个交付计划是否已完成
@@ -146,6 +145,5 @@ type Manifest struct {
 	EpisodeID     int         `json:"episode_id"`
 	Timestamp     string      `json:"timestamp"`
 	PackageName   string      `json:"package_name"`
-	// 修复：移除错误的 `types.` 前缀
 	Files         []*FileNode `json:"files"`
 }
