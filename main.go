@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -88,7 +89,6 @@ func displayDeliveryProgress(plan *types.Plan, workspaceName string) {
 	}
 }
 
-
 func selectWorkspace() string {
 	for {
 		fmt.Print("\n请输入或拖入工作区文件夹路径: ")
@@ -105,7 +105,7 @@ func selectWorkspace() string {
 
 func handleScanAndDeliver() {
 	workspacePath := selectWorkspace()
-	workspaceName := filepath.Base(workspacePath)
+	workspaceName := util.GetWorkspaceName(workspacePath) // 【核心修正】: 使用新的工具函数
 	beanckupDir := filepath.Join(workspacePath, ".beanckup")
 	if err := os.MkdirAll(beanckupDir, 0755); err != nil {
 		log.Printf("错误: 无法创建 .beanckup 目录: %v", err)
@@ -115,7 +115,6 @@ func handleScanAndDeliver() {
 	if err := util.SetHidden(beanckupDir); err != nil {
 		log.Printf("警告: 无法将 .beanckup 文件夹设置为隐藏: %v", err)
 	}
-
 
 	fmt.Printf("\n已选择工作区: %s\n", workspacePath)
 
@@ -411,6 +410,102 @@ func executeDeliveryLoop(workspacePath, workspaceName, beanckupDir string, plan 
 	}
 }
 
+func executeDelivery(episode *types.Episode, workspacePath, workspaceName, beanckupDir string, plan *types.Plan, params *session.DeliveryParams) {
+	episode.Status = types.EpisodeStatusInProgress
+	session.SavePlan(workspacePath, plan) // 更新状态
+
+	timestamp := time.Now().Format("060102_150405")
+	// 【核心修正】: 文件名使用下划线
+	pkgName := fmt.Sprintf("%s_S%02dE%02d_%s.7z", workspaceName, plan.SessionID, episode.ID, timestamp)
+
+	fmt.Printf("\n--- 正在交付 [E%02d]: %s ---\n", episode.ID, pkgName)
+
+	// 1. 生成包名和清单对象
+	episodePackageName := manifest.GeneratePackageName(workspaceName, plan.SessionID, episode.ID)
+
+	// 2. 创建一个包含所有数据文件的临时清单，用于生成 Reference
+	packageManifest := manifest.CreateManifest(workspaceName, plan.SessionID, episode.ID, episodePackageName, episode.Files)
+
+	// 3. 确定引用名 (是否分卷)
+	packageSizeLimitBytes := int64(params.PackageSizeLimitMB) * 1024 * 1024
+	willBeSplit := params.PackageSizeLimitMB > 0 && episode.TotalSize > packageSizeLimitBytes
+
+	// 4. 为清单中的新文件设置正确的引用
+	var finalFilesForManifest []*types.FileNode
+	for _, fileNode := range episode.Files {
+		if fileNode.Reference == "" {
+			refPackageName := episodePackageName
+			if willBeSplit {
+				refPackageName += ".001"
+			}
+			fileNode.Reference = fmt.Sprintf("%s/%s", refPackageName, fileNode.Path)
+		}
+		finalFilesForManifest = append(finalFilesForManifest, fileNode)
+	}
+	if episode.ID == 1 {
+		finalFilesForManifest = append(finalFilesForManifest, types.FilterReferenceFiles(plan.AllNodes)...)
+	}
+	packageManifest.Files = finalFilesForManifest
+
+	// 5. 将最终的清单文件写入工作区的 .beanckup 目录
+	manifestFilePath, err := manifest.SaveManifest(packageManifest, beanckupDir)
+	if err != nil {
+		log.Printf("错误: 无法保存清单文件到历史记录: %v", err)
+		// 这是一个非关键性错误，只记录日志，不中断流程
+	}
+
+	// 6. 准备待打包文件列表，将清单文件也作为一个节点加入
+	filesToPack := make([]*types.FileNode, len(episode.Files))
+	copy(filesToPack, episode.Files)
+
+	manifestRelPath, _ := filepath.Rel(workspacePath, manifestFilePath)
+	manifestInfo, _ := os.Stat(manifestFilePath)
+	manifestNode := &types.FileNode{
+		Path: filepath.ToSlash(manifestRelPath),
+		Size: manifestInfo.Size(),
+	}
+	filesToPack = append(filesToPack, manifestNode)
+
+	// 7. 调用简化的打包器
+	pkg := packager.NewPackager()
+	packageProgress := util.NewProgressDisplay()
+
+	err = pkg.CreatePackage(
+		params.DeliveryPath,
+		episodePackageName,
+		workspacePath,
+		filesToPack,
+		params.Password,
+		params.CompressionLevel,
+		params.PackageSizeLimitMB,
+		func(p packager.Progress) {
+			packageProgress.UpdateProgress("  > 正在处理 [%d/%d]: %d%%", episode.ID, len(plan.Episodes), p.Percentage)
+		},
+	)
+	packageProgress.Finish()
+
+	// 8. 【核心修正】: 只有在打包失败时才清理临时的清单文件。
+	// 成功后，清单文件必须保留在.beanckup目录作为历史记录。
+	if err != nil {
+		log.Printf("\n错误: 创建交付包 %s 失败: %v", episodePackageName, err)
+		os.Remove(manifestFilePath) // 打包失败，清理掉这个无效的清单
+		episode.Status = types.EpisodeStatusPending
+		session.SavePlan(workspacePath, plan)
+		if !askForConfirmation("交付失败，是否继续尝试下一个包?") {
+			return
+		}
+		return
+	}
+
+	fmt.Printf("✅ 交付包 %s 创建成功!\n", pkgName)
+
+	// 9. 更新计划状态并保存
+	episode.Status = types.EpisodeStatusCompleted
+	if _, err := session.SavePlan(workspacePath, plan); err != nil {
+		log.Printf("错误: 更新交付计划失败: %v", err)
+	}
+}
+
 func analyzeFileChanges(allNodes []*types.FileNode, histState *types.HistoricalState) (newCount, movedCount, deletedCount int, newSize int64) {
 	currentFilesByPath := make(map[string]*types.FileNode)
 	for _, node := range allNodes {
@@ -551,17 +646,15 @@ func askForResumeDeliveryParams() *session.DeliveryParams {
 
 func handleRestore() {
 	fmt.Println("\n=== 文件恢复 ===")
-	fmt.Print("请输入交付包存放路径 (回车使用默认): ")
-	deliveryPath, _ := reader.ReadString('\n')
-	deliveryPath = strings.TrimSpace(deliveryPath)
-	if deliveryPath == "" {
-		deliveryPath = "./delivery"
-	}
+	deliveryPath := askForDeliveryPath()
+
+	// 【核心修正】: 恢复器现在只需要交付路径
 	res, err := restorer.NewRestorer(deliveryPath)
 	if err != nil {
 		log.Printf("错误: 初始化恢复器失败: %v\n", err)
 		return
 	}
+
 	sessions, err := res.DiscoverDeliverySessions()
 	if err != nil {
 		log.Printf("错误: 发现交付包失败: %v\n", err)
@@ -571,52 +664,33 @@ func handleRestore() {
 		fmt.Printf("在路径 '%s' 中未找到任何交付包\n", deliveryPath)
 		return
 	}
-	fmt.Printf("\n发现 %d 个备份记录:\n", len(sessions))
-	for i, session := range sessions {
-		res.LoadSessionManifests(session, "") // 预加载以获取时间戳
-		fmt.Printf("  [%d] S%d - %s\n",
-			i+1,
-			session.SessionID,
-			session.Timestamp.Format("2006-01-02 15:04:05"))
-	}
-	fmt.Print("\n请选择要恢复的备份记录 (1-", len(sessions), "): ")
-	choice, _ := reader.ReadString('\n')
-	choice = strings.TrimSpace(choice)
-	choiceIndex, err := strconv.Atoi(choice)
-	if err != nil || choiceIndex < 1 || choiceIndex > len(sessions) {
-		fmt.Println("无效选择，返回主菜单。")
+
+	selectedSession, err := selectSessionToRestoreUI(sessions)
+	if err != nil {
+		fmt.Println(err)
 		return
 	}
-	selectedSession := sessions[choiceIndex-1]
-	fmt.Print("请输入加密密码 (如果包未加密则留空): ")
-	password, _ := reader.ReadString('\n')
-	password = strings.TrimSpace(password)
-	fmt.Printf("\n正在加载 S%d 的清单文件...\n", selectedSession.SessionID)
 
+	password := askForPassword()
 	err = res.LoadSessionManifests(selectedSession, password)
 	if err != nil {
 		log.Printf("错误: 加载清单文件失败: %v\n", err)
 		return
 	}
-	fmt.Printf("成功加载 %d 个交付包的清单文件\n", len(selectedSession.Manifests))
-	fmt.Print("请输入恢复目标路径 (回车使用默认): ")
-	restorePath, _ := reader.ReadString('\n')
-	restorePath = strings.TrimSpace(restorePath)
-	if restorePath == "" {
-		restorePath = "./restore"
-	}
-	if !askForConfirmation("是否开始恢复文件?") {
-		fmt.Println("取消恢复。")
+
+	restorePath := askForRestorePath()
+	if !confirmRestore(selectedSession, restorePath, password) {
+		fmt.Println("恢复操作已取消。")
 		return
 	}
+
 	if err = res.RestoreFromSession(selectedSession, restorePath, password); err != nil {
 		log.Printf("错误: 恢复失败: %v\n", err)
 	} else {
 		workspaceName := "workspace"
 		if len(selectedSession.Manifests) > 0 {
-			workspaceName = selectedSession.Manifests[0].WorkspaceName
+			workspaceName = util.GetWorkspaceName(selectedSession.Manifests[0].WorkspaceName)
 		}
-		// 【核心修正】: 更新时间戳格式为 YYMMDD_HHMMSS
 		ts := selectedSession.Timestamp.Format("060102_150405")
 		recoveryDir := fmt.Sprintf("%s_S%d_%s_Recovery", workspaceName, selectedSession.SessionID, ts)
 		finalRestorePath := filepath.Join(restorePath, recoveryDir)
@@ -624,8 +698,72 @@ func handleRestore() {
 	}
 }
 
+func selectSessionToRestoreUI(sessions []*restorer.DeliverySession) (*restorer.DeliverySession, error) {
+	fmt.Printf("\n发现 %d 个备份记录:\n", len(sessions))
+	for i, session := range sessions {
+		// 预加载以获取时间戳等信息
+		if len(session.Manifests) > 0 {
+			fmt.Printf("  [%d] %s (S%d) - %s\n",
+				i+1,
+				session.Manifests[0].WorkspaceName,
+				session.SessionID,
+				session.Timestamp.Format("2006-01-02 15:04:05"))
+		} else {
+			// 如果没有清单，可能是旧格式或损坏的
+			fmt.Printf("  [%d] S%d - (时间戳未知)\n", i+1, session.SessionID)
+		}
+	}
+	fmt.Print("\n请选择要恢复的备份记录 (1-", len(sessions), "): ")
+	choice, _ := reader.ReadString('\n')
+	choice = strings.TrimSpace(choice)
+	choiceIndex, err := strconv.Atoi(choice)
+	if err != nil || choiceIndex < 1 || choiceIndex > len(sessions) {
+		return nil, fmt.Errorf("无效选择，返回主菜单")
+	}
+	return sessions[choiceIndex-1], nil
+}
+
+func askForPassword() string {
+	fmt.Print("请输入加密密码 (如果包未加密则留空): ")
+	password, _ := reader.ReadString('\n')
+	return strings.TrimSpace(password)
+}
+
+func confirmRestore(session *restorer.DeliverySession, restorePath, password string) bool {
+	fmt.Println("\n--- 恢复确认 ---")
+	if len(session.Manifests) > 0 {
+		fmt.Printf("将从 %s (S%d) 恢复\n", session.Manifests[0].WorkspaceName, session.SessionID)
+	}
+	fmt.Printf("时间戳: %s\n", session.Timestamp.Format("2006-01-02 15:04:05"))
+	fmt.Printf("恢复到: %s\n", restorePath)
+	if password != "" {
+		fmt.Println("解压密码: 已提供")
+	}
+	return askForConfirmation("是否开始恢复文件?")
+}
+
+func askForDeliveryPath() string {
+	fmt.Print("请输入交付包存放路径 (回车使用默认): ")
+	deliveryPath, _ := reader.ReadString('\n')
+	deliveryPath = strings.TrimSpace(deliveryPath)
+	if deliveryPath == "" {
+		deliveryPath = "./delivery"
+	}
+	return deliveryPath
+}
+
+func askForRestorePath() string {
+	fmt.Print("请输入恢复目标路径 (回车使用默认): ")
+	restorePath, _ := reader.ReadString('\n')
+	restorePath = strings.TrimSpace(restorePath)
+	if restorePath == "" {
+		restorePath = "./restore"
+	}
+	return restorePath
+}
+
 func askForConfirmation(prompt string) bool {
-	fmt.Print(prompt + " (y/n): ")
+	fmt.Printf("%s (y/n): ", prompt)
 	choice, _ := reader.ReadString('\n')
 	return strings.ToLower(strings.TrimSpace(choice)) == "y"
 }

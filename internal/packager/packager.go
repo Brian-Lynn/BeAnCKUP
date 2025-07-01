@@ -30,7 +30,7 @@ func NewPackager() *Packager {
 	return &Packager{}
 }
 
-// CreatePackage 使用最简单、最可靠的“一次性打包”模型。
+// CreatePackage 使用最简单、最可靠的"一次性打包"模型。
 // 它接收一个包含所有数据文件和清单文件的列表，然后执行一次 `7z a` 命令。
 func (p *Packager) CreatePackage(
 	deliveryPath string,
@@ -64,8 +64,8 @@ func (p *Packager) CreatePackage(
 	packageFilePath := filepath.Join(deliveryPath, packageName)
 	args := []string{
 		"a",
-		packageFilePath,    // 最终输出的压缩包基础名
-		"@" + listFilePath, // 让7z根据列表读取文件
+		packageFilePath,     // 最终输出的压缩包基础名
+		"@" + listFilePath,  // 让7z根据列表读取文件
 		"-w" + deliveryPath, // 强制临时文件在交付目录生成
 		fmt.Sprintf("-mx=%d", compressionLevel),
 		"-mmt=on",
@@ -88,6 +88,10 @@ func (p *Packager) CreatePackage(
 	if password != "" {
 		args = append(args, "-p"+password, "-mhe=on")
 	}
+
+	// [新增] 打印7z命令参数和工作目录
+	log.Printf("[DEBUG] 7z 命令参数: 7z %s", strings.Join(args, " "))
+	log.Printf("[DEBUG] 工作目录: %s", workspaceRoot)
 
 	// 4. 执行一次性的 `7z a` 命令
 	cmd := exec.Command("7z", args...)
@@ -125,7 +129,10 @@ func run7zAndHandleProgress(cmd *exec.Cmd, packageName, stage string, progressCa
 		return fmt.Errorf("启动 7z 命令失败: %w", err)
 	}
 
-	go io.Copy(io.Discard, stderr)
+	var stderrBuf strings.Builder
+	go func() {
+		io.Copy(&stderrBuf, stderr)
+	}()
 
 	reader := bufio.NewReader(stdout)
 	for {
@@ -144,7 +151,22 @@ func run7zAndHandleProgress(cmd *exec.Cmd, packageName, stage string, progressCa
 		}
 	}
 
-	return cmd.Wait()
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			// Exit code 1 是 7z 的非致命警告 (例如，有文件被锁定无法访问)
+			// 我们应该记录它，但不应将其视为整个打包过程的失败。
+			if exitErr.ExitCode() == 1 {
+				log.Printf("[警告] 7z 执行时返回非致命错误 (代码 1)，打包可能已部分成功。错误详情: %s", stderrBuf.String())
+				return nil // 视为成功
+			}
+		}
+		// 其他错误 (包括其他退出代码) 视为致命错误。
+		log.Printf("[ERROR] 7z 命令执行失败: %v", waitErr)
+		log.Printf("[ERROR] 7z 标准错误输出: %s", stderrBuf.String())
+		return fmt.Errorf("7z 命令执行失败: %w\n7z stderr: %s", waitErr, stderrBuf.String())
+	}
+	return nil
 }
 
 // parse7zProgress 保持不变

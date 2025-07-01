@@ -40,11 +40,34 @@ func (idx *Indexer) ScanWithProgress(workspacePath string, progressCallback func
 	var allNodes []*types.FileNode
 	var filesToScan []string
 
+	// 【核心修正】: 根目录扫描时，定义系统排除项
+	isRootScan := util.IsRoot(workspacePath)
+	systemExclusions := map[string]bool{
+		"$recycle.bin":              true,
+		"system volume information": true,
+		"pagefile.sys":              true,
+		"swapfile.sys":              true,
+		"hiberfil.sys":              true,
+		"dumpstack.log.tmp":         true,
+	}
+
 	// 1. 生产者准备：预扫描以获取文件总数，用于进度条
 	filepath.Walk(workspacePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
+		// 【核心修正】: 应用排除规则
+		if isRootScan && path != workspacePath {
+			if parent, err := filepath.Rel(workspacePath, filepath.Dir(path)); err == nil && parent == "." {
+				if systemExclusions[strings.ToLower(info.Name())] {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
+
 		if !info.IsDir() {
 			if strings.Contains(path, ".beanckup") || strings.EqualFold(info.Name(), "Thumbs.db") {
 				return nil
@@ -98,11 +121,30 @@ func (idx *Indexer) ScanWithProgress(workspacePath string, progressCallback func
 	// 4. 生产者：遍历文件系统，将任务放入 jobs 通道
 	err := filepath.Walk(workspacePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			if os.IsPermission(err) {
+				log.Printf("[警告] 权限不足，跳过: %s", path)
+				return nil // 权限错误，跳过该文件或目录
+			}
+			return err // 其他错误，中断扫描
 		}
+
+		// 【核心修正】: 应用排除规则
+		if isRootScan && path != workspacePath {
+			if parent, err := filepath.Rel(workspacePath, filepath.Dir(path)); err == nil && parent == "." {
+				if systemExclusions[strings.ToLower(info.Name())] {
+					log.Printf("[信息] 根据根目录排除规则，跳过系统项: %s", path)
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
+
 		if info.IsDir() && info.Name() == ".beanckup" {
 			return filepath.SkipDir
 		}
+
 		if path == workspacePath {
 			return nil
 		}

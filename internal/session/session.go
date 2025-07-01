@@ -2,6 +2,7 @@ package session
 
 import (
 	"beanckup-cli/internal/types"
+	"beanckup-cli/internal/util"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -147,7 +148,7 @@ func SavePlan(workspacePath string, plan *types.Plan) (string, error) {
 		return "", fmt.Errorf("无法创建 .beanckup 目录: %w", err)
 	}
 
-	workspaceName := filepath.Base(workspacePath)
+	workspaceName := util.GetWorkspaceName(workspacePath)
 	// 【核心修正】: 更新时间戳格式为 YYMMDD_HHMMSS
 	timestamp := plan.Timestamp.Format("060102_150405")
 	planFileName := fmt.Sprintf("Delivery_Status_%s_S%02d_%s.json", workspaceName, plan.SessionID, timestamp)
@@ -185,7 +186,8 @@ func cleanupOldStatusFiles(dir string, currentSessionID int, currentPlanPath str
 	if err != nil {
 		return
 	}
-	prefix := fmt.Sprintf("Delivery_Status_%s_S%02d_", filepath.Base(filepath.Dir(dir)), currentSessionID)
+	workspaceName := util.GetWorkspaceName(filepath.Dir(dir))
+	prefix := fmt.Sprintf("Delivery_Status_%s_S%02d_", workspaceName, currentSessionID)
 	for _, file := range files {
 		path := filepath.Join(dir, file.Name())
 		if !file.IsDir() && strings.HasPrefix(file.Name(), prefix) && path != currentPlanPath {
@@ -231,6 +233,7 @@ func FindLatestPlan(workspacePath string) (*types.Plan, string, error) {
 		var plan types.Plan
 		if err := json.Unmarshal(data, &plan); err == nil {
 			if !plan.IsCompleted() {
+				plan.StatusFilePath = planPath
 				return &plan, planPath, nil
 			}
 		}
@@ -253,7 +256,7 @@ func CleanupIncompletePackages(deliveryPath string, plan *types.Plan, workspaceN
 				fmt.Printf("清理不完整的交付包: %s\n", packageName)
 				os.Remove(packagePath)
 			}
-			
+
 			globPattern := packagePath + ".*"
 			if files, _ := filepath.Glob(globPattern); files != nil {
 				for _, f := range files {
